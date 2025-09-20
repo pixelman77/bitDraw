@@ -1,0 +1,4 @@
+build/
+vendored/
+.vscode
+tris_viewer
