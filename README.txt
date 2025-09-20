@@ -1,0 +1,1 @@
+you need SDL3 in vendored/ to compile this
