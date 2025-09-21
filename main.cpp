@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <bits/stdc++.h>
 
 enum ProjectionMode
 {
@@ -17,7 +18,8 @@ enum RenderMode
     RENDER_WIREFRAME,
     RENDER_PAINTERS,
     RENDER_ZBUFFER_MODEL,
-    RENDER_ZBUFFER_BUFFER
+    RENDER_ZBUFFER_BUFFER,
+    RENDER_NO_DEPTH
 };
 
 enum TriangleRasterMethod
@@ -28,8 +30,9 @@ enum TriangleRasterMethod
 
 //default options
 ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
-RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
+RenderMode renderMode = RenderMode::RENDER_PAINTERS;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
+bool backfaceCulling = true;
 
 
 //buffer input gets a seizure with these and I have no idea why
@@ -38,10 +41,16 @@ uint32_t SCREEN_HEIGHT = 600;
 float HALFWIDTH = SCREEN_WIDTH / 2;
 float HALFHEIGHT = SCREEN_HEIGHT / 2;
 
+uint32_t packARGB(uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
+    return (static_cast<uint32_t>(a) << 24) |
+           (static_cast<uint32_t>(r) << 16) |
+           (static_cast<uint32_t>(g) << 8)  |
+           (static_cast<uint32_t>(b));
+}
+
 double signed_triangle_area(int ax, int ay, int bx, int by, int cx, int cy) {
     return .5*((by-ay)*(bx+ax) + (cy-by)*(cx+bx) + (ay-cy)*(ax+cx));
 }
-
 
 struct ScreenBuffer
 {
@@ -162,6 +171,8 @@ struct ScreenBuffer
         int bbmaxy = std::max(std::max(ay, by), cy);
         double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
 
+    //he got tricked into thinking it would work this time!
+    //mint issue?
     #pragma omp parallel for
         for (int x=bbminx; x<=bbmaxx; x++) {
             for (int y=bbminy; y<=bbmaxy; y++) {
@@ -256,14 +267,6 @@ struct Camera
     }
 };
 
-Vector3d cross(const Vector3d &a, const Vector3d &b)
-{
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x};
-}
-
 
 
 std::vector<Triangle> loadTRIS(const std::string &filename)
@@ -335,6 +338,52 @@ Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3
     return Vector3d(rx + pivot.x, ry + pivot.y, rz + pivot.z);
 }
 
+float squaredDistance(const Vector3d& a, const Vector3d& b) {
+    float dx = a.x - b.x;
+    float dy = a.y - b.y;
+    float dz = a.z - b.z;
+    return dx*dx + dy*dy + dz*dz;
+}
+
+Vector3d centroid(const Triangle& t) {
+    return {
+        (t.v1.x + t.v2.x + t.v3.x) / 3.0f,
+        (t.v1.y + t.v2.y + t.v3.y) / 3.0f,
+        (t.v1.z + t.v2.z + t.v3.z) / 3.0f
+    };
+}
+
+//unholy beast
+// Comparator for std::sort
+struct TriangleComparator {
+    Vector3d point; // usually the camera position
+
+    TriangleComparator(const Vector3d& p) : point(p) {}
+
+    bool operator()(const Triangle& t1, const Triangle& t2) const {
+        Vector3d c1 = {
+            (t1.v1.x + t1.v2.x + t1.v3.x) / 3.0f,
+            (t1.v1.y + t1.v2.y + t1.v3.y) / 3.0f,
+            (t1.v1.z + t1.v2.z + t1.v3.z) / 3.0f
+        };
+        Vector3d c2 = {
+            (t2.v1.x + t2.v2.x + t2.v3.x) / 3.0f,
+            (t2.v1.y + t2.v2.y + t2.v3.y) / 3.0f,
+            (t2.v1.z + t2.v2.z + t2.v3.z) / 3.0f
+        };
+
+        float d1 = (c1.x - point.x)*(c1.x - point.x) +
+                   (c1.y - point.y)*(c1.y - point.y) +
+                   (c1.z - point.z)*(c1.z - point.z);
+
+        float d2 = (c2.x - point.x)*(c2.x - point.x) +
+                   (c2.y - point.y)*(c2.y - point.y) +
+                   (c2.z - point.z)*(c2.z - point.z);
+
+        return d1 > d2; 
+    }
+};
+
 
 Vector2di orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer){
     
@@ -350,25 +399,68 @@ Vector2di orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer
 
 void renderFrame(ScreenBuffer &screenBuffer, const Camera &camera, const std::vector<std::vector<Triangle>> &models){
 
+
+    //clear the screen
+    screenBuffer.fill(0);
     
+    //projection function
     Vector2di (*projFun)(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer);
     projFun = orthos;
 
+    //triangle draw function
+    void (ScreenBuffer::*triDrFunc)(int ax, int ay, int bx, int by, int cx, int cy, uint32_t color);
+    if(rasterMode == TriangleRasterMethod::SCANLINE){ triDrFunc = &ScreenBuffer::triangleRasterScanLine; }
+    if(rasterMode == TriangleRasterMethod::BOUNDING_BOX){ triDrFunc = &ScreenBuffer::triangleRasterBoundingBox; }
 
 
 
-
+    int tr_count;
     for(std::vector<Triangle> tris : models){
-        for(Triangle t: tris){
+        
+        tr_count = 0;
+
+        std::vector<Triangle> modified_tris;
+        if(renderMode == RenderMode::RENDER_PAINTERS){
+            modified_tris = tris;
+
+            std::sort(modified_tris.begin(), modified_tris.end(), TriangleComparator(camera.position));
+        }
+        else{
+            modified_tris = std::move(tris);
+        }
+
+        for(Triangle t: modified_tris){
+
+            if(backfaceCulling){
+                //backface culling logic goes here (no shit)
+            }
+
             Vector2di p1, p2, p3;
             p1 = projFun(t.v1, camera, screenBuffer);
             p2 = projFun(t.v2, camera, screenBuffer);
             p3 = projFun(t.v3, camera, screenBuffer);
 
-            screenBuffer.line(p1.x, p1.y, p2.x, p2.y, 0xFFFFFFFF);
-            screenBuffer.line(p2.x, p2.y, p3.x, p3.y, 0xFFFFFFFF);
-            screenBuffer.line(p3.x, p3.y, p1.x, p1.y, 0xFFFFFFFF);
+            //placeholder code until I decide how to handle loose vertexes
+            if(renderMode == RenderMode::RENDER_WIREFRAME){
 
+                screenBuffer.line(p1.x, p1.y, p2.x, p2.y, 0xFFFFFFFF);
+                screenBuffer.line(p2.x, p2.y, p3.x, p3.y, 0xFFFFFFFF);
+                screenBuffer.line(p3.x, p3.y, p1.x, p1.y, 0xFFFFFFFF);
+            }
+            if(renderMode == RenderMode::RENDER_NO_DEPTH || renderMode == RenderMode::RENDER_PAINTERS){
+                uint8_t r, g, b;
+                srand(tr_count);
+                r = rand() % 256;
+                srand(tr_count + 10);
+                g = rand() % 256;
+                srand(tr_count + 20);
+                b = rand() % 256;
+                uint32_t color = packARGB(255, r, g, b);
+                (screenBuffer.*triDrFunc)(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, color);
+            }
+
+
+            tr_count++;
         }
     }
         
@@ -431,7 +523,6 @@ int main() {
 
         // Clear screen with a color (red, green, blue, alpha)
         SDL_RenderClear(renderer);
-        screenBuffer.fill(0);
 
         renderFrame(screenBuffer, mainCamera, models);
 
