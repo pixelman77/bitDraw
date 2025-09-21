@@ -20,12 +20,27 @@ enum RenderMode
     RENDER_ZBUFFER_BUFFER
 };
 
+enum TriangleRasterMethod
+{
+    SCANLINE,
+    BOUNDING_BOX
+};
+
+//default options
+ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
+RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
+TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
+
 
 //buffer input gets a seizure with these and I have no idea why
 uint32_t SCREEN_WIDTH = 800;
 uint32_t SCREEN_HEIGHT = 600;
 float HALFWIDTH = SCREEN_WIDTH / 2;
 float HALFHEIGHT = SCREEN_HEIGHT / 2;
+
+double signed_triangle_area(int ax, int ay, int bx, int by, int cx, int cy) {
+    return .5*((by-ay)*(bx+ax) + (cy-by)*(cx+bx) + (ay-cy)*(ax+cx));
+}
 
 
 struct ScreenBuffer
@@ -49,6 +64,7 @@ struct ScreenBuffer
         std::fill(buffer.begin(), buffer.end(), color);
     }
 
+    //boundry check too slow?
     uint32_t get(int x, int y){
         if(x >= width || y>=height) return 0;
         return buffer[y * width + x];
@@ -110,6 +126,54 @@ struct ScreenBuffer
 
     }
     */
+
+
+    void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, u_int32_t color) {
+        // sort the vertices, a,b,c in ascending y order (bubblesort yay!)
+        if (ay>by) { std::swap(ax, bx); std::swap(ay, by); }
+        if (ay>cy) { std::swap(ax, cx); std::swap(ay, cy); }
+        if (by>cy) { std::swap(bx, cx); std::swap(by, cy); }
+        int total_height = cy-ay;
+
+        if (ay != by) { // if the bottom half is not degenerate
+            int segment_height = by - ay;
+            for (int y=ay; y<=by; y++) { // sweep the horizontal line from ay to by
+                int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
+                int x2 = ax + ((bx - ax)*(y - ay)) / segment_height;
+                for (int x=std::min(x1,x2); x<std::max(x1,x2); x++)  // draw a horizontal line
+                    set(x, y, color);
+            }
+        }
+        if (by != cy) { // if the upper half is not degenerate
+            int segment_height = cy - by;
+            for (int y=by; y<=cy; y++) { // sweep the horizontal line from by to cy
+                int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
+                int x2 = bx + ((cx - bx)*(y - by)) / segment_height;
+                for (int x=std::min(x1,x2); x<std::max(x1,x2); x++)  // draw a horizontal line
+                    set(x, y, color);
+            }
+        }
+    }
+
+    void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, uint32_t color) {
+        int bbminx = std::min(std::min(ax, bx), cx); // bounding box for the triangle
+        int bbminy = std::min(std::min(ay, by), cy); // defined by its top left and bottom right corners
+        int bbmaxx = std::max(std::max(ax, bx), cx);
+        int bbmaxy = std::max(std::max(ay, by), cy);
+        double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
+
+    #pragma omp parallel for
+        for (int x=bbminx; x<=bbmaxx; x++) {
+            for (int y=bbminy; y<=bbmaxy; y++) {
+                double alpha = signed_triangle_area(x, y, bx, by, cx, cy) / total_area;
+                double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
+                double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
+                if (alpha<0 || beta<0 || gamma<0) continue; // negative barycentric coordinate => the pixel is outside the triangle
+                set(x, y, color);
+            }
+        }
+    }
+
 };
 
 struct Vector2d
@@ -272,7 +336,7 @@ Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3
 }
 
 
-Vector2di orthos(Vector3d point, Camera &camera, ScreenBuffer &screenBuffer){
+Vector2di orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer){
     
     Vector2di screenPoint;
     Vector3d relative = point - camera.position;
@@ -284,11 +348,43 @@ Vector2di orthos(Vector3d point, Camera &camera, ScreenBuffer &screenBuffer){
     return screenPoint;
 }
 
+void renderFrame(ScreenBuffer &screenBuffer, const Camera &camera, const std::vector<std::vector<Triangle>> &models){
+
+    
+    Vector2di (*projFun)(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer);
+    projFun = orthos;
+
+
+
+
+
+    for(std::vector<Triangle> tris : models){
+        for(Triangle t: tris){
+            Vector2di p1, p2, p3;
+            p1 = projFun(t.v1, camera, screenBuffer);
+            p2 = projFun(t.v2, camera, screenBuffer);
+            p3 = projFun(t.v3, camera, screenBuffer);
+
+            screenBuffer.line(p1.x, p1.y, p2.x, p2.y, 0xFFFFFFFF);
+            screenBuffer.line(p2.x, p2.y, p3.x, p3.y, 0xFFFFFFFF);
+            screenBuffer.line(p3.x, p3.y, p1.x, p1.y, 0xFFFFFFFF);
+
+        }
+    }
+        
+
+}
+
 int main() {
 
 
     ScreenBuffer screenBuffer(800, 600);
+    
     std::vector<Triangle> tris = loadTRIS("utah_teapot.tris");
+    std::vector<std::vector<Triangle>> models;
+
+    models.push_back(tris);
+
     Camera mainCamera;
     mainCamera.aspect = screenBuffer.width / screenBuffer.height;
     mainCamera.zoom = 90.0f;
@@ -318,7 +414,6 @@ int main() {
 
 
     
-    
 
     bool running = true;
     SDL_Event event;
@@ -338,22 +433,7 @@ int main() {
         SDL_RenderClear(renderer);
         screenBuffer.fill(0);
 
-        int c = 0;
-
-        for(Triangle t: tris){
-            Vector2di p1, p2, p3;
-            p1 = orthos(t.v1, mainCamera, screenBuffer);
-            p2 = orthos(t.v2, mainCamera, screenBuffer);
-            p3 = orthos(t.v3, mainCamera, screenBuffer);
-
-            screenBuffer.line(p1.x, p1.y, p2.x, p2.y, 0xFFFFFFFF);
-            screenBuffer.line(p2.x, p2.y, p3.x, p3.y, 0xFFFFFFFF);
-            screenBuffer.line(p3.x, p3.y, p1.x, p1.y, 0xFFFFFFFF);
-
-            SDL_Log(std::to_string(c).c_str());
-            c++;
-        }
-        
+        renderFrame(screenBuffer, mainCamera, models);
 
 
         mainCamera.rotation.y += 0.005f;
