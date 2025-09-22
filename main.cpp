@@ -39,10 +39,10 @@ enum LightMode
 ProjectionMode projectionMode = ProjectionMode::PROJ_ORTHOGRAPHIC;
 RenderMode renderMode = RenderMode::RENDER_PAINTERS;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
-LightMode lightMode = LightMode::LAMBERTIAN_SHADE;
+LightMode lightMode = LightMode::RANDOM_COLOR;
 bool backfaceCulling = true;
 
-int orthographicHurlUnit = 1000;
+int orthographicHurlUnit = 1000; //camera position is moved back by this amount to simulate a far away camera 
 
 
 //buffer input gets a seizure with these and I have no idea why
@@ -478,9 +478,8 @@ Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3
 //this is not even a believeable light source
 struct LambertLight {
     Vector3d direction = Vector3d(1, -1, -1).normalized(); // should be normalized
-    float intensity = 0.5;    // 0..1
+    float intensity = 1.0;    // 0..1
 };
-
 
 float computeLambertLighting(Triangle& tri, const LambertLight& light) {
     Vector3d n = tri.Normal();     // Surface normal
@@ -569,7 +568,7 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
         for(Triangle t: modified_tris){
 
             if(backfaceCulling){
-                //backface culling logic goes here (no shit)
+                if(camera.getDirection().dot(t.Normal()) >= 0){ continue; }
             }
 
             Vector2di p1, p2, p3;
@@ -590,15 +589,12 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
 
                 if(lightMode == LightMode::RANDOM_COLOR){
                     //absolutely stupid way to assign colors but this is for showcasing purposes
-                    srand(int(t.v1.x * 1000));
-                    r = rand() % 256;
-                    srand(int(t.v2.y * 1000));
-                    g = rand() % 256;
-                    srand(int(t.v3.z * 1000));
-                    b = rand() % 256;
+                    r = int(t.v1.x * 10000) % 256;
+                    g = int(t.v2.y * 10000) % 256;
+                    b = int(t.v3.z * 10000) % 256;
                 }
                 if(lightMode == LightMode::LAMBERTIAN_SHADE){
-                    globalLambertLight.direction = camera.getDirection().cross(Vector3d(0, -1, 0)).normalized();
+                    globalLambertLight.direction = camera.getDirection().cross(Vector3d(0, -0.7, 0.7)).normalized();
                     float intensity = computeLambertLighting(t, globalLambertLight);
                     r = intensity * 255;
                     g = r;
@@ -680,7 +676,7 @@ int main() {
         renderFrame(screenBuffer, mainCamera, models);
 
 
-        mainCamera.rotation.y += 0.005f;
+        
         // Present the frame
         SDL_UpdateTexture(framebuffer, nullptr, screenBuffer.buffer.data(), screenBuffer.width * sizeof(uint32_t));
 
@@ -691,8 +687,11 @@ int main() {
 
 	    Uint64 end = SDL_GetPerformanceCounter();
 
-	    float elapsed = (end - start) / (float)SDL_GetPerformanceFrequency();
-        std::string title = "fps: " + std::to_string(1.0f / elapsed);
+	    float delta = (end - start) / (float)SDL_GetPerformanceFrequency();
+
+        mainCamera.rotation.y += 0.5f * delta;
+
+        std::string title = "fps: " + std::to_string(1.0f / delta);
 	    SDL_SetWindowTitle(window , title.c_str());
     }
 
