@@ -28,10 +28,18 @@ enum TriangleRasterMethod
     BOUNDING_BOX
 };
 
+enum LightMode
+{
+    PHONG,
+    RANDOM_COLOR,
+    LAMBERTIAN_SHADE
+};
+
 //default options
 ProjectionMode projectionMode = ProjectionMode::PROJ_ORTHOGRAPHIC;
 RenderMode renderMode = RenderMode::RENDER_PAINTERS;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
+LightMode lightMode = LightMode::LAMBERTIAN_SHADE;
 bool backfaceCulling = true;
 
 int orthographicHurlUnit = 1000;
@@ -250,6 +258,26 @@ struct Vector3d
         float dz = z - rhs.z;
         return dx*dx + dy*dy + dz*dz;
     }
+
+    Vector3d cross(const Vector3d& b) {
+        return {
+            y * b.z - z * b.y,
+            z * b.x - x * b.z,
+            x * b.y - y * b.x
+        };
+    }
+
+    float dot(const Vector3d& b) {
+        return x * b.x + y * b.y + z * b.z;
+    }
+
+    float length() {
+        return std::sqrt(dot(*this));
+    }
+
+
+
+
 };
 
 struct Triangle
@@ -270,8 +298,15 @@ struct Triangle
             (v1.z + v2.z + v3.z) / 3.0f);
     }
 
+    Vector3d Normal() {
+        Vector3d edge1 = v2 - v1;
+        Vector3d edge2 = v3 - v1;
+        return edge1.cross(edge2).normalized();
+    }
+    
 
 };
+
 
 
 struct Camera
@@ -344,6 +379,66 @@ std::vector<Triangle> loadTRIS(const std::string &filename)
     return triangles;
 }
 
+std::vector<Triangle> loadOBJ(const std::string& filename) {
+    std::vector<Triangle> triangles;
+    std::vector<Vector3d> vertices;
+
+    std::ifstream file(filename);
+    if (!file) {
+        std::cerr << "Failed to open OBJ file: " << filename << "\n";
+        return triangles;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream iss(line);
+
+        std::string type;
+        iss >> type;
+
+        if (type == "v") {
+            // Vertex position
+            Vector3d v;
+            iss >> v.x >> v.y >> v.z;
+            vertices.push_back(v);
+        }
+        else if (type == "f") {
+            // Face (triangle only)
+            int i1, i2, i3;
+            char slash; // to skip over / if present (e.g. f 1/1/1 2/2/2 3/3/3)
+            std::string v1, v2, v3;
+
+            iss >> v1 >> v2 >> v3;
+
+            auto parseIndex = [](const std::string& token) {
+                std::istringstream ss(token);
+                int index;
+                ss >> index;
+                return index;
+            };
+
+            i1 = parseIndex(v1);
+            i2 = parseIndex(v2);
+            i3 = parseIndex(v3);
+
+            // Convert to 0-based
+            i1--; i2--; i3--;
+
+            if (i1 >= 0 && i1 < (int)vertices.size() &&
+                i2 >= 0 && i2 < (int)vertices.size() &&
+                i3 >= 0 && i3 < (int)vertices.size()) {
+                Triangle t;
+                t.v1 = vertices[i1];
+                t.v2 = vertices[i2];
+                t.v3 = vertices[i3];
+                triangles.push_back(t);
+            }
+        }
+    }
+
+    return triangles;
+}
+
 
 // Rotate a point around a pivot using Euler angles (rotation.x, rotation.y, rotation.z)
 Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3d& rotation) {
@@ -379,7 +474,26 @@ Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3
     return Vector3d(rx + pivot.x, ry + pivot.y, rz + pivot.z);
 }
 
+//this bit is ONLY TO BE USED FOR SHOWCASING
+//this is not even a believeable light source
+struct LambertLight {
+    Vector3d direction = Vector3d(1, -1, -1).normalized(); // should be normalized
+    float intensity = 0.5;    // 0..1
+};
 
+
+float computeLambertLighting(Triangle& tri, const LambertLight& light) {
+    Vector3d n = tri.Normal();     // Surface normal
+    Vector3d l = light.direction;
+
+    float dotNL = n.dot(l);
+    float diffuse = std::max(0.0f, dotNL) * light.intensity;
+
+    // Add some ambient light so faces in shadow aren't pure black
+    float ambient = 0.2f;
+    return std::min(1.0f, ambient + diffuse);
+}
+LambertLight globalLambertLight;
 
 
 //unholy beast
@@ -472,17 +586,27 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
             }
             if(renderMode == RenderMode::RENDER_NO_DEPTH || renderMode == RenderMode::RENDER_PAINTERS){
 
-                //absolutely stupid way to assign colors but this is for showcasing purposes
                 uint8_t r, g, b;
-                srand(int(t.v1.x * 1000));
-                r = rand() % 256;
-                srand(int(t.v2.y * 1000));
-                g = rand() % 256;
-                srand(int(t.v3.z * 1000));
-                b = rand() % 256;
+
+                if(lightMode == LightMode::RANDOM_COLOR){
+                    //absolutely stupid way to assign colors but this is for showcasing purposes
+                    srand(int(t.v1.x * 1000));
+                    r = rand() % 256;
+                    srand(int(t.v2.y * 1000));
+                    g = rand() % 256;
+                    srand(int(t.v3.z * 1000));
+                    b = rand() % 256;
+                }
+                if(lightMode == LightMode::LAMBERTIAN_SHADE){
+                    globalLambertLight.direction = camera.getDirection().cross(Vector3d(0, -1, 0)).normalized();
+                    float intensity = computeLambertLighting(t, globalLambertLight);
+                    r = intensity * 255;
+                    g = r;
+                    b = r;
+                }
+
+
                 uint32_t color = packARGB(255, r, g, b);
-
-
                 (screenBuffer.*triDrFunc)(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, color);
             }
 
@@ -502,16 +626,18 @@ int main() {
     std::vector<Triangle> tris = loadTRIS("utah_teapot.tris");
     std::vector<std::vector<Triangle>> models;
 
+    tris = loadOBJ("diablo3_pos.obj");
+
     models.push_back(tris);
 
     Camera mainCamera;
     mainCamera.aspect = screenBuffer.width / screenBuffer.height;
-    mainCamera.zoom = 90.0f;
-    mainCamera.position.y = 2;
+    mainCamera.zoom = 200.0f;
+    mainCamera.position.y = 0;
     
 
     SDL_Window* window = SDL_CreateWindow("Hello SDL3",
-                                          SCREEN_WIDTH, SCREEN_HEIGHT, 0);
+                                          screenBuffer.width, screenBuffer.height, 0);
     if (!window) {
         std::cerr << "SDL_CreateWindow Error: " << SDL_GetError() << "\n";
         SDL_Quit();
