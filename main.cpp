@@ -29,10 +29,12 @@ enum TriangleRasterMethod
 };
 
 //default options
-ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
+ProjectionMode projectionMode = ProjectionMode::PROJ_ORTHOGRAPHIC;
 RenderMode renderMode = RenderMode::RENDER_PAINTERS;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
 bool backfaceCulling = true;
+
+int orthographicHurlUnit = 1000;
 
 
 //buffer input gets a seizure with these and I have no idea why
@@ -229,12 +231,24 @@ struct Vector3d
         return {x - rhs.x, y - rhs.y, z - rhs.z};
     }
 
+    Vector3d operator*(const int &rhs) const
+    {
+        return {x * rhs, y * rhs, z * rhs};
+    }
+
     Vector3d normalized()
     {
         float len = std::sqrt(x * x + y * y + z * z);
         if (len == 0)
             return {0, 0, 0};
         return {x / len, y / len, z / len};
+    }
+
+    float squaredDistance(const Vector3d& rhs) {
+        float dx = x - rhs.x;
+        float dy = y - rhs.y;
+        float dz = z - rhs.z;
+        return dx*dx + dy*dy + dz*dz;
     }
 };
 
@@ -248,7 +262,17 @@ struct Triangle
         v2 = Vector3d();
         v3 = Vector3d();
     }
+
+    Vector3d centroid() {
+        return Vector3d(
+            (v1.x + v2.x + v3.x) / 3.0f,
+            (v1.y + v2.y + v3.y) / 3.0f,
+            (v1.z + v2.z + v3.z) / 3.0f);
+    }
+
+
 };
+
 
 struct Camera
 {
@@ -265,6 +289,23 @@ struct Camera
         zoom = 80.0f;
         aspect = SCREEN_WIDTH / SCREEN_HEIGHT;
     }
+
+    Vector3d getDirection() {
+        float cosPitch = std::cos(rotation.x);
+        float sinPitch = std::sin(rotation.x);
+        float cosYaw   = std::cos(rotation.y);
+        float sinYaw   = std::sin(rotation.y);
+
+        return {
+            cosPitch * sinYaw,  // x
+            -sinPitch,          // y (note: depends on convention)
+            cosPitch * cosYaw   // z
+        };
+        //is this normalized?
+    }
+
+
+
 };
 
 
@@ -338,48 +379,23 @@ Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3
     return Vector3d(rx + pivot.x, ry + pivot.y, rz + pivot.z);
 }
 
-float squaredDistance(const Vector3d& a, const Vector3d& b) {
-    float dx = a.x - b.x;
-    float dy = a.y - b.y;
-    float dz = a.z - b.z;
-    return dx*dx + dy*dy + dz*dz;
-}
 
-Vector3d centroid(const Triangle& t) {
-    return {
-        (t.v1.x + t.v2.x + t.v3.x) / 3.0f,
-        (t.v1.y + t.v2.y + t.v3.y) / 3.0f,
-        (t.v1.z + t.v2.z + t.v3.z) / 3.0f
-    };
-}
+
 
 //unholy beast
 // Comparator for std::sort
-struct TriangleComparator {
+struct TriangleDistanceComparator {
     Vector3d point; // usually the camera position
 
-    TriangleComparator(const Vector3d& p) : point(p) {}
+    TriangleDistanceComparator(const Vector3d& p) : point(p) {}
 
-    bool operator()(const Triangle& t1, const Triangle& t2) const {
-        Vector3d c1 = {
-            (t1.v1.x + t1.v2.x + t1.v3.x) / 3.0f,
-            (t1.v1.y + t1.v2.y + t1.v3.y) / 3.0f,
-            (t1.v1.z + t1.v2.z + t1.v3.z) / 3.0f
-        };
-        Vector3d c2 = {
-            (t2.v1.x + t2.v2.x + t2.v3.x) / 3.0f,
-            (t2.v1.y + t2.v2.y + t2.v3.y) / 3.0f,
-            (t2.v1.z + t2.v2.z + t2.v3.z) / 3.0f
-        };
+    bool operator()(Triangle& t1, Triangle& t2) const {
+        Vector3d c1 = t1.centroid();
+        Vector3d c2 = t2.centroid();
 
-        float d1 = (c1.x - point.x)*(c1.x - point.x) +
-                   (c1.y - point.y)*(c1.y - point.y) +
-                   (c1.z - point.z)*(c1.z - point.z);
+        float d1 = c1.squaredDistance(point);
 
-        float d2 = (c2.x - point.x)*(c2.x - point.x) +
-                   (c2.y - point.y)*(c2.y - point.y) +
-                   (c2.z - point.z)*(c2.z - point.z);
-
+        float d2 = c2.squaredDistance(point);
         return d1 > d2; 
     }
 };
@@ -397,7 +413,7 @@ Vector2di orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer
     return screenPoint;
 }
 
-void renderFrame(ScreenBuffer &screenBuffer, const Camera &camera, const std::vector<std::vector<Triangle>> &models){
+void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<std::vector<Triangle>> &models){
 
 
     //clear the screen
@@ -423,7 +439,14 @@ void renderFrame(ScreenBuffer &screenBuffer, const Camera &camera, const std::ve
         if(renderMode == RenderMode::RENDER_PAINTERS){
             modified_tris = tris;
 
-            std::sort(modified_tris.begin(), modified_tris.end(), TriangleComparator(camera.position));
+
+            Vector3d camLoc = camera.position;
+            if( projectionMode == ProjectionMode::PROJ_ORTHOGRAPHIC){
+
+                //not using origin point might cause problem
+                camLoc = camLoc + camera.getDirection() * -orthographicHurlUnit;
+            }
+            std::sort(modified_tris.begin(), modified_tris.end(), TriangleDistanceComparator(camLoc));
         }
         else{
             modified_tris = std::move(tris);
@@ -448,14 +471,18 @@ void renderFrame(ScreenBuffer &screenBuffer, const Camera &camera, const std::ve
                 screenBuffer.line(p3.x, p3.y, p1.x, p1.y, 0xFFFFFFFF);
             }
             if(renderMode == RenderMode::RENDER_NO_DEPTH || renderMode == RenderMode::RENDER_PAINTERS){
+
+                //absolutely stupid way to assign colors but this is for showcasing purposes
                 uint8_t r, g, b;
-                srand(tr_count);
+                srand(int(t.v1.x * 1000));
                 r = rand() % 256;
-                srand(tr_count + 10);
+                srand(int(t.v2.y * 1000));
                 g = rand() % 256;
-                srand(tr_count + 20);
+                srand(int(t.v3.z * 1000));
                 b = rand() % 256;
                 uint32_t color = packARGB(255, r, g, b);
+
+
                 (screenBuffer.*triDrFunc)(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, color);
             }
 
