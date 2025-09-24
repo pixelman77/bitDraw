@@ -6,6 +6,7 @@
 #include <iostream>
 #include <string>
 #include <bits/stdc++.h>
+#include <OBJ_Loader.h>
 
 enum ProjectionMode
 {
@@ -50,6 +51,8 @@ uint32_t SCREEN_WIDTH = 800;
 uint32_t SCREEN_HEIGHT = 600;
 float HALFWIDTH = SCREEN_WIDTH / 2;
 float HALFHEIGHT = SCREEN_HEIGHT / 2;
+
+bool assignedRandomColor = false;
 
 uint32_t packARGB(uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
     return (static_cast<uint32_t>(a) << 24) |
@@ -217,6 +220,7 @@ struct Vector2di
         this->y = y;
     }
 };
+#include <cmath>
 
 struct Vector3d
 {
@@ -229,6 +233,7 @@ struct Vector3d
         this->z = z;
     }
 
+    // --- Operators ---
     Vector3d operator+(const Vector3d &rhs) const
     {
         return {x + rhs.x, y + rhs.y, z + rhs.z};
@@ -239,56 +244,76 @@ struct Vector3d
         return {x - rhs.x, y - rhs.y, z - rhs.z};
     }
 
-    Vector3d operator*(const int &rhs) const
+    Vector3d operator*(float rhs) const
     {
         return {x * rhs, y * rhs, z * rhs};
     }
 
-    Vector3d normalized()
+    Vector3d operator/(float rhs) const
     {
-        float len = std::sqrt(x * x + y * y + z * z);
-        if (len == 0)
-            return {0, 0, 0};
-        return {x / len, y / len, z / len};
+        return {x / rhs, y / rhs, z / rhs};
     }
 
-    float squaredDistance(const Vector3d& rhs) {
+    // --- Vector math ---
+    Vector3d normalized() const
+    {
+        float len = length();
+        if (len == 0) return {0, 0, 0};
+        return *this / len;
+    }
+
+    float squaredDistance(const Vector3d &rhs) const
+    {
         float dx = x - rhs.x;
         float dy = y - rhs.y;
         float dz = z - rhs.z;
-        return dx*dx + dy*dy + dz*dz;
+        return dx * dx + dy * dy + dz * dz;
     }
 
-    Vector3d cross(const Vector3d& b) {
+    Vector3d cross(const Vector3d &b) const
+    {
         return {
             y * b.z - z * b.y,
             z * b.x - x * b.z,
-            x * b.y - y * b.x
-        };
+            x * b.y - y * b.x};
     }
 
-    float dot(const Vector3d& b) {
+    float dot(const Vector3d &b) const
+    {
         return x * b.x + y * b.y + z * b.z;
     }
 
-    float length() {
+    float length() const
+    {
         return std::sqrt(dot(*this));
     }
 
+    Vector3d rotateByAngle(const Vector3d &axis, float angle) const
+    {
+        Vector3d u = axis.normalized();
+        float cosA = std::cos(angle);
+        float sinA = std::sin(angle);
 
+        return (*this * cosA) +
+               (u.cross(*this) * sinA) +
+               (u * (u.dot(*this) * (1 - cosA)));
+    }
 
 
 };
 
+
 struct Triangle
 {
     Vector3d v1, v2, v3;
+    uint32_t color; //only for RANDOM_COLOR
 
     Triangle()
     {
         v1 = Vector3d();
         v2 = Vector3d();
         v3 = Vector3d();
+        color = packARGB(255, SDL_rand(256), SDL_rand(256), SDL_rand(256));
     }
 
     Vector3d centroid() {
@@ -339,6 +364,44 @@ struct Camera
         //is this normalized?
     }
 
+    void orbitAroundPoint(const Vector3d& target, float angle, char axis, bool keepFacing) {
+    // Translate to target-relative coordinates
+    Vector3d relative = position - target;
+
+    // Rotate around chosen axis
+    float c = std::cos(angle);
+    float s = std::sin(angle);
+    Vector3d rotated = relative;
+
+    switch (axis) {
+        case 'x': // rotate around X-axis
+            rotated.y = relative.y * c - relative.z * s;
+            rotated.z = relative.y * s + relative.z * c;
+            break;
+        case 'y': // rotate around Y-axis
+            rotated.x = relative.x * c + relative.z * s;
+            rotated.z = -relative.x * s + relative.z * c;
+            break;
+        case 'z': // rotate around Z-axis
+            rotated.x = relative.x * c - relative.y * s;
+            rotated.y = relative.x * s + relative.y * c;
+            break;
+    }
+
+    // Update position
+    position = target + rotated;
+
+    // If keepFacing is true, make camera look at target
+    if (keepFacing) {
+        Vector3d dir = (target - position).normalized();
+
+        // Extract yaw and pitch from direction
+        rotation.y = std::atan2(dir.x, dir.z);       // yaw
+        rotation.x = std::asin(-dir.y);              // pitch
+        // leave rotation.z (roll) unchanged
+    }
+}
+
 
 
 };
@@ -381,60 +444,51 @@ std::vector<Triangle> loadTRIS(const std::string &filename)
 
 std::vector<Triangle> loadOBJ(const std::string& filename) {
     std::vector<Triangle> triangles;
-    std::vector<Vector3d> vertices;
 
+
+    //probably objl can be modified to use local types to remove some overhead
+    objl::Loader loader;
     std::ifstream file(filename);
-    if (!file) {
-        std::cerr << "Failed to open OBJ file: " << filename << "\n";
+
+
+    bool isLoaded = loader.LoadFile(filename);
+    if(!isLoaded){
+        SDL_Log("failed to load OBJ file");
         return triangles;
     }
 
-    std::string line;
-    while (std::getline(file, line)) {
-        std::istringstream iss(line);
 
-        std::string type;
-        iss >> type;
+    for(objl::Mesh mesh: loader.LoadedMeshes){
+        for (int j = 0; j < mesh.Indices.size(); j += 3)
+			{
+				int i1, i2, i3;
+                i1 = mesh.Indices[j];
+                i2 = mesh.Indices[j + 1];
+                i3 = mesh.Indices[j + 2];
 
-        if (type == "v") {
-            // Vertex position
-            Vector3d v;
-            iss >> v.x >> v.y >> v.z;
-            vertices.push_back(v);
-        }
-        else if (type == "f") {
-            // Face (triangle only)
-            int i1, i2, i3;
-            char slash; // to skip over / if present (e.g. f 1/1/1 2/2/2 3/3/3)
-            std::string v1, v2, v3;
+                Vector3d v1, v2, v3;
 
-            iss >> v1 >> v2 >> v3;
+                v1.x = mesh.Vertices[i1].Position.X;
+                v1.y = mesh.Vertices[i1].Position.Y;
+                v1.z = mesh.Vertices[i1].Position.Z;
 
-            auto parseIndex = [](const std::string& token) {
-                std::istringstream ss(token);
-                int index;
-                ss >> index;
-                return index;
-            };
+                v2.x = mesh.Vertices[i2].Position.X;
+                v2.y = mesh.Vertices[i2].Position.Y;
+                v2.z = mesh.Vertices[i2].Position.Z;
 
-            i1 = parseIndex(v1);
-            i2 = parseIndex(v2);
-            i3 = parseIndex(v3);
+                v3.x = mesh.Vertices[i3].Position.X;
+                v3.y = mesh.Vertices[i3].Position.Y;
+                v3.z = mesh.Vertices[i3].Position.Z;
 
-            // Convert to 0-based
-            i1--; i2--; i3--;
+                Triangle tri;
+                tri.v1 = v1;
+                tri.v2 = v2;
+                tri.v3 = v3;
 
-            if (i1 >= 0 && i1 < (int)vertices.size() &&
-                i2 >= 0 && i2 < (int)vertices.size() &&
-                i3 >= 0 && i3 < (int)vertices.size()) {
-                Triangle t;
-                t.v1 = vertices[i1];
-                t.v2 = vertices[i2];
-                t.v3 = vertices[i3];
-                triangles.push_back(t);
-            }
-        }
+                triangles.push_back(tri);
+			}
     }
+
 
     return triangles;
 }
@@ -477,7 +531,7 @@ Vector3d rotatePoint(const Vector3d& point, const Vector3d& pivot, const Vector3
 //this bit is ONLY TO BE USED FOR SHOWCASING
 //this is not even a believeable light source
 struct LambertLight {
-    Vector3d direction = Vector3d(1, -1, -1).normalized(); // should be normalized
+    Vector3d direction = Vector3d(-1, 0, 1).normalized(); // should be normalized
     float intensity = 1.0;    // 0..1
 };
 
@@ -497,6 +551,7 @@ LambertLight globalLambertLight;
 
 //unholy beast
 // Comparator for std::sort
+//perhaps calculating all 3 axis for orthographic is causing visual artifacts?
 struct TriangleDistanceComparator {
     Vector3d point; // usually the camera position
 
@@ -526,15 +581,37 @@ Vector2di orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer
     return screenPoint;
 }
 
-void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<std::vector<Triangle>> &models){
+Vector2di pers(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer) {
+    //this function is plagued by the thing known as "vibecode"
+
+    Vector2di screenPoint;
+
+    Vector3d relative = point - camera.position;
+
+    Vector3d rotatedPoint = rotatePoint(relative, Vector3d(0,0,0), Vector3d(-camera.rotation.x, -camera.rotation.y, -camera.rotation.z));
+
+    if (rotatedPoint.z <= 0.001f) 
+        rotatedPoint.z = 0.001f;
+
+    float scale = (camera.fov / rotatedPoint.z);
+
+    screenPoint.x = rotatedPoint.x * scale * camera.aspect * screenBuffer.halfwidth + screenBuffer.halfwidth;
+    screenPoint.y = -rotatedPoint.y * scale * screenBuffer.halfheight + screenBuffer.halfheight;
+
+    return screenPoint;
+}
+
+
+void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<Triangle> &tris){
 
 
     //clear the screen
     screenBuffer.fill(0);
-    
+
     //projection function
     Vector2di (*projFun)(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer);
-    projFun = orthos;
+    if(projectionMode == ProjectionMode::PROJ_ORTHOGRAPHIC) projFun = orthos;
+    if(projectionMode == ProjectionMode::PROJ_PERSPECTIVE) projFun = pers;
 
     //triangle draw function
     void (ScreenBuffer::*triDrFunc)(int ax, int ay, int bx, int by, int cx, int cy, uint32_t color);
@@ -543,10 +620,10 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
 
 
 
-    int tr_count;
-    for(std::vector<Triangle> tris : models){
+    int draw_count, all_count;
         
-        tr_count = 0;
+        draw_count = 0;
+        all_count = 0;
 
         std::vector<Triangle> modified_tris;
         if(renderMode == RenderMode::RENDER_PAINTERS){
@@ -566,6 +643,8 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
         }
 
         for(Triangle t: modified_tris){
+
+            all_count++;
 
             if(backfaceCulling){
                 if(camera.getDirection().dot(t.Normal()) >= 0){ continue; }
@@ -587,14 +666,8 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
 
                 uint8_t r, g, b;
 
-                if(lightMode == LightMode::RANDOM_COLOR){
-                    //absolutely stupid way to assign colors but this is for showcasing purposes
-                    r = int(t.v1.x * 10000) % 256;
-                    g = int(t.v2.y * 10000) % 256;
-                    b = int(t.v3.z * 10000) % 256;
-                }
                 if(lightMode == LightMode::LAMBERTIAN_SHADE){
-                    globalLambertLight.direction = camera.getDirection().cross(Vector3d(0, -0.7, 0.7)).normalized();
+                    globalLambertLight.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
                     float intensity = computeLambertLighting(t, globalLambertLight);
                     r = intensity * 255;
                     g = r;
@@ -603,33 +676,41 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<s
 
 
                 uint32_t color = packARGB(255, r, g, b);
+                if(lightMode == LightMode::RANDOM_COLOR){
+                    color = t.color;
+                }
+
+
+
+
                 (screenBuffer.*triDrFunc)(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, color);
             }
 
 
-            tr_count++;
-        }
-    }
+            draw_count++;
+        } 
         
 
 }
 
 int main() {
 
-
-    ScreenBuffer screenBuffer(800, 600);
+    ScreenBuffer screenBuffer(800, 800);
     
-    std::vector<Triangle> tris = loadTRIS("utah_teapot.tris");
+    std::vector<Triangle> tris;
     std::vector<std::vector<Triangle>> models;
 
+
     tris = loadOBJ("diablo3_pos.obj");
+
 
     models.push_back(tris);
 
     Camera mainCamera;
     mainCamera.aspect = screenBuffer.width / screenBuffer.height;
-    mainCamera.zoom = 200.0f;
+    mainCamera.zoom = 250.0f;
     mainCamera.position.y = 0;
+    mainCamera.position.z = -2;
     
 
     SDL_Window* window = SDL_CreateWindow("Hello SDL3",
@@ -670,10 +751,13 @@ int main() {
         }
 
 
+
+
+        
         // Clear screen with a color (red, green, blue, alpha)
         SDL_RenderClear(renderer);
 
-        renderFrame(screenBuffer, mainCamera, models);
+        renderFrame(screenBuffer, mainCamera, tris);
 
 
         
@@ -689,7 +773,7 @@ int main() {
 
 	    float delta = (end - start) / (float)SDL_GetPerformanceFrequency();
 
-        mainCamera.rotation.y += 0.5f * delta;
+        mainCamera.orbitAroundPoint(Vector3d(), 0.4f * delta, 'y', true);
 
         std::string title = "fps: " + std::to_string(1.0f / delta);
 	    SDL_SetWindowTitle(window , title.c_str());
