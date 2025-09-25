@@ -150,7 +150,7 @@ struct ScreenBuffer
     */
 
 
-    void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, u_int32_t color) {
+    void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, uint32_t color) {
         // sort the vertices, a,b,c in ascending y order (bubblesort yay!)
         if (ay>by) { std::swap(ax, bx); std::swap(ay, by); }
         if (ay>cy) { std::swap(ax, cx); std::swap(ay, cy); }
