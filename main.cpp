@@ -8,6 +8,9 @@
 #include <bits/stdc++.h>
 #include <OBJ_Loader.h>
 
+const float FLOAT_MAX = 1000.0f; //not the max, but a usable amount
+const float ZDEPTH_VISIBLE = 3.0f;
+
 enum ProjectionMode
 {
     PROJ_PERSPECTIVE,
@@ -31,17 +34,25 @@ enum TriangleRasterMethod
 
 enum LightMode
 {
+    CONSTANT,
     PHONG,
-    RANDOM_COLOR,
     LAMBERTIAN_SHADE
+};
+
+enum ColorMode
+{
+    SOLID_WHITE,
+    RANDOM_COLOR,
+    TEXTURE
 };
 
 //default options
 ProjectionMode projectionMode = ProjectionMode::PROJ_ORTHOGRAPHIC;
-RenderMode renderMode = RenderMode::RENDER_PAINTERS;
-TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
-LightMode lightMode = LightMode::RANDOM_COLOR;
-bool backfaceCulling = true;
+RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
+TriangleRasterMethod rasterMode = TriangleRasterMethod::BOUNDING_BOX;
+LightMode lightMode = LightMode::CONSTANT;
+ColorMode colorMode = ColorMode::RANDOM_COLOR;
+bool backfaceCulling = false;
 
 int orthographicHurlUnit = 1000; //camera position is moved back by this amount to simulate a far away camera 
 
@@ -70,6 +81,7 @@ struct ScreenBuffer
     // note to self: w of h/x of y
     // down growing
     std::vector<uint32_t> buffer;
+    std::vector<float> zBuffer;
     int width, height;
     float halfwidth, halfheight;
 
@@ -80,6 +92,7 @@ struct ScreenBuffer
         halfheight = height / 2;
         halfwidth = width / 2;
         buffer = std::vector<uint32_t>(width * height, 0);
+        zBuffer = std::vector<float>(width * height, FLOAT_MAX);
     }
 
     void fill(uint32_t color){
@@ -97,28 +110,25 @@ struct ScreenBuffer
         buffer[y * width + x] = color;
     }
 
-    void line( int x0, int y0, int x1, int y1, uint32_t color) {
-        int dx = std::abs(x1 - x0);
-        int dy = std::abs(y1 - y0);
-        int sx = (x0 < x1) ? 1 : -1;
-        int sy = (y0 < y1) ? 1 : -1;
-        int err = dx - dy;
+    void drainZBuffer(){
+        std::fill(zBuffer.begin(), zBuffer.end(), FLOAT_MAX);
+    }
 
-        while (true) {
-            set(x0, y0, color); // draw the pixel
+    //boundry check too slow?
+    float getZBuffer(int x, int y){
+        if(x >= width || y>=height) return 0;
+        return zBuffer[y * width + x];
+    }
 
-            if (x0 == x1 && y0 == y1) break;
+    void setZBuffer(int x, int y, float val){
+        if(x < 0 || y < 0 || x >= width || y>=height) return;
+        zBuffer[y * width + x] = val;
+    }
 
-            int e2 = 2 * err;
-            if (e2 > -dy) {
-                err -= dy;
-                x0 += sx;
-            }
-            if (e2 < dx) {
-                err += dx;
-                y0 += sy;
-            }
-        }
+    bool updateZBuffer(int x, int y, float val){
+        if(getZBuffer(x, y) < val){ return false; }
+        setZBuffer(x, y, val);
+        return true;
     }
 
 //this following code only draws vertexes (either from one side or wherever), will I ever investigate?
@@ -148,9 +158,34 @@ struct ScreenBuffer
 
     }
     */
+};
 
 
-    void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, u_int32_t color) {
+void drawLine( int x0, int y0, int x1, int y1, ScreenBuffer &buffer, uint32_t color) {
+        int dx = std::abs(x1 - x0);
+        int dy = std::abs(y1 - y0);
+        int sx = (x0 < x1) ? 1 : -1;
+        int sy = (y0 < y1) ? 1 : -1;
+        int err = dx - dy;
+
+        while (true) {
+            buffer.set(x0, y0, color); // draw the pixel
+
+            if (x0 == x1 && y0 == y1) break;
+
+            int e2 = 2 * err;
+            if (e2 > -dy) {
+                err -= dy;
+                x0 += sx;
+            }
+            if (e2 < dx) {
+                err += dx;
+                y0 += sy;
+            }
+        }
+}
+
+void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, u_int32_t color) {
         // sort the vertices, a,b,c in ascending y order (bubblesort yay!)
         if (ay>by) { std::swap(ax, bx); std::swap(ay, by); }
         if (ay>cy) { std::swap(ax, cx); std::swap(ay, cy); }
@@ -163,7 +198,7 @@ struct ScreenBuffer
                 int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
                 int x2 = ax + ((bx - ax)*(y - ay)) / segment_height;
                 for (int x=std::min(x1,x2); x<std::max(x1,x2); x++)  // draw a horizontal line
-                    set(x, y, color);
+                    buffer.set(x, y, color);
             }
         }
         if (by != cy) { // if the upper half is not degenerate
@@ -172,12 +207,60 @@ struct ScreenBuffer
                 int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
                 int x2 = bx + ((cx - bx)*(y - by)) / segment_height;
                 for (int x=std::min(x1,x2); x<std::max(x1,x2); x++)  // draw a horizontal line
-                    set(x, y, color);
+                    buffer.set(x, y, color);
+            }
+        }
+}
+
+
+void triangleRasterScanLine_ZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, u_int32_t color) {
+        
+        double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
+
+        //if (total_area<1) return;
+        //alt back face culling
+
+        if (ay>by) { std::swap(ax, bx); std::swap(ay, by); std::swap(az, bz); }
+        if (ay>cy) { std::swap(ax, cx); std::swap(ay, cy); std::swap(az, cz); }
+        if (by>cy) { std::swap(bx, cx); std::swap(by, cy); std::swap(bz, cz); }
+        int total_height = cy-ay;
+        
+
+        if (ay != by) { 
+            int segment_height = by - ay;
+            for (int y=ay; y<=by; y++) { 
+                int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
+                int x2 = ax + ((bx - ax)*(y - ay)) / segment_height;
+                for (int x=std::min(x1,x2); x<std::max(x1,x2); x++){  
+                    double alpha = signed_triangle_area(x, y, bx, by, cx, cy) / total_area;
+                    double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
+                    double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
+
+                    float z = (alpha * az + beta * bz + gamma * cz);
+                    if(buffer.updateZBuffer(x, y, z)){ buffer.set(x, y, color); }
+                }                    
+            }
+        }
+        if (by != cy) { 
+            int segment_height = cy - by;
+            for (int y=by; y<=cy; y++) { 
+                int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
+                int x2 = bx + ((cx - bx)*(y - by)) / segment_height;
+                for (int x=std::min(x1,x2); x<std::max(x1,x2); x++){  
+                    double alpha = signed_triangle_area(x, y, bx, by, cx, cy) / total_area;
+                    double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
+                    double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
+
+                    float z = (alpha * az + beta * bz + gamma * cz);
+                    if(buffer.updateZBuffer(x, y, z)){ buffer.set(x, y, color); } 
+                }                   
             }
         }
     }
 
-    void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, uint32_t color) {
+
+
+void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, uint32_t color) {
         int bbminx = std::min(std::min(ax, bx), cx); // bounding box for the triangle
         int bbminy = std::min(std::min(ay, by), cy); // defined by its top left and bottom right corners
         int bbmaxx = std::max(std::max(ax, bx), cx);
@@ -186,19 +269,42 @@ struct ScreenBuffer
 
     //he got tricked into thinking it would work this time!
     //mint issue?
-    #pragma omp parallel for
+        #pragma omp parallel for
         for (int x=bbminx; x<=bbmaxx; x++) {
             for (int y=bbminy; y<=bbmaxy; y++) {
                 double alpha = signed_triangle_area(x, y, bx, by, cx, cy) / total_area;
                 double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
                 double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
                 if (alpha<0 || beta<0 || gamma<0) continue; // negative barycentric coordinate => the pixel is outside the triangle
-                set(x, y, color);
+                buffer.set(x, y, color);
             }
         }
     }
 
-};
+
+void triangleRasterBoundingBoxZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, uint32_t color) {
+        int bbminx = std::min(std::min(ax, bx), cx); // bounding box for the triangle
+        int bbminy = std::min(std::min(ay, by), cy); // defined by its top left and bottom right corners
+        int bbmaxx = std::max(std::max(ax, bx), cx);
+        int bbmaxy = std::max(std::max(ay, by), cy);
+        double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
+
+    //he got tricked into thinking it would work this time!
+    //mint issue?
+        #pragma omp parallel for
+        for (int x=bbminx; x<=bbmaxx; x++) {
+            for (int y=bbminy; y<=bbmaxy; y++) {
+                double alpha = signed_triangle_area(x, y, bx, by, cx, cy) / total_area;
+                double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
+                double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
+                if (alpha<0 || beta<0 || gamma<0) continue; // negative barycentric coordinate => the pixel is outside the triangle
+                float z = (alpha * az + beta * bz + gamma * cz);
+                if(buffer.updateZBuffer(x, y, z)) buffer.set(x, y, color);
+            }
+        }
+    }
+
+
 
 struct Vector2d
 {
@@ -211,15 +317,18 @@ struct Vector2d
     // arithmetc logic?
 };
 
-struct Vector2di
+struct ScreenPoint
 {
     int x, y;
-    Vector2di(int x = 0, int y = 0)
+    float z;
+    ScreenPoint(int x = 0, int y = 0, float z = 0)
     {
         this->x = x;
         this->y = y;
+        this->z = z;
     }
 };
+
 #include <cmath>
 
 struct Vector3d
@@ -306,14 +415,17 @@ struct Vector3d
 struct Triangle
 {
     Vector3d v1, v2, v3;
-    uint32_t color; //only for RANDOM_COLOR
+    uint8_t a, r, g, b;
 
     Triangle()
     {
         v1 = Vector3d();
         v2 = Vector3d();
         v3 = Vector3d();
-        color = packARGB(255, SDL_rand(256), SDL_rand(256), SDL_rand(256));
+        a = 255;
+        r = SDL_rand(256);
+        g = SDL_rand(256);
+        b = SDL_rand(256);
     }
 
     Vector3d centroid() {
@@ -328,7 +440,7 @@ struct Triangle
         Vector3d edge2 = v3 - v1;
         return edge1.cross(edge2).normalized();
     }
-    
+
 
 };
 
@@ -365,6 +477,9 @@ struct Camera
     }
 
     void orbitAroundPoint(const Vector3d& target, float angle, char axis, bool keepFacing) {
+    //funnily enough, orbiting x causes a sin motion which while not intended, is pretty useful
+
+
     // Translate to target-relative coordinates
     Vector3d relative = position - target;
 
@@ -568,35 +683,41 @@ struct TriangleDistanceComparator {
     }
 };
 
+ScreenPoint orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer) {
+    ScreenPoint screenPoint;
 
-Vector2di orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer){
-    
-    Vector2di screenPoint;
     Vector3d relative = point - camera.position;
-    Vector3d rotatedPoint = rotatePoint(relative, Vector3d(0,0,0), Vector3d(-camera.rotation.x, -camera.rotation.y, -camera.rotation.z));
+    Vector3d rotatedPoint = rotatePoint(
+        relative, 
+        Vector3d(0,0,0), 
+        Vector3d(-camera.rotation.x, -camera.rotation.y, -camera.rotation.z)
+    );
 
-    screenPoint.x = rotatedPoint.x * camera.zoom * camera.aspect + screenBuffer.halfwidth; 
-    screenPoint.y = -rotatedPoint.y * camera.zoom + screenBuffer.halfheight;
+    screenPoint.x = static_cast<int>(rotatedPoint.x * camera.zoom * camera.aspect + screenBuffer.halfwidth); 
+    screenPoint.y = static_cast<int>(-rotatedPoint.y * camera.zoom + screenBuffer.halfheight);
+    screenPoint.z = rotatedPoint.z; // depth in camera space
 
     return screenPoint;
 }
 
-Vector2di pers(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer) {
-    //this function is plagued by the thing known as "vibecode"
-
-    Vector2di screenPoint;
+ScreenPoint pers(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer) {
+    ScreenPoint screenPoint;
 
     Vector3d relative = point - camera.position;
-
-    Vector3d rotatedPoint = rotatePoint(relative, Vector3d(0,0,0), Vector3d(-camera.rotation.x, -camera.rotation.y, -camera.rotation.z));
+    Vector3d rotatedPoint = rotatePoint(
+        relative, 
+        Vector3d(0,0,0), 
+        Vector3d(-camera.rotation.x, -camera.rotation.y, -camera.rotation.z)
+    );
 
     if (rotatedPoint.z <= 0.001f) 
         rotatedPoint.z = 0.001f;
 
     float scale = (camera.fov / rotatedPoint.z);
 
-    screenPoint.x = rotatedPoint.x * scale * camera.aspect * screenBuffer.halfwidth + screenBuffer.halfwidth;
-    screenPoint.y = -rotatedPoint.y * scale * screenBuffer.halfheight + screenBuffer.halfheight;
+    screenPoint.x = static_cast<int>(rotatedPoint.x * scale * camera.aspect * screenBuffer.halfwidth + screenBuffer.halfwidth);
+    screenPoint.y = static_cast<int>(-rotatedPoint.y * scale * screenBuffer.halfheight + screenBuffer.halfheight);
+    screenPoint.z = rotatedPoint.z; // depth in camera space
 
     return screenPoint;
 }
@@ -607,89 +728,116 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
 
     //clear the screen
     screenBuffer.fill(0);
+    screenBuffer.drainZBuffer();
+
+    if(lightMode == LightMode::LAMBERTIAN_SHADE) {
+        globalLambertLight.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
+    }
+
 
     //projection function
-    Vector2di (*projFun)(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer);
-    if(projectionMode == ProjectionMode::PROJ_ORTHOGRAPHIC) projFun = orthos;
-    if(projectionMode == ProjectionMode::PROJ_PERSPECTIVE) projFun = pers;
+    ScreenPoint (*project)(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer);
+    if(projectionMode == ProjectionMode::PROJ_ORTHOGRAPHIC) project = orthos;
+    if(projectionMode == ProjectionMode::PROJ_PERSPECTIVE) project = pers;
 
-    //triangle draw function
-    void (ScreenBuffer::*triDrFunc)(int ax, int ay, int bx, int by, int cx, int cy, uint32_t color);
-    if(rasterMode == TriangleRasterMethod::SCANLINE){ triDrFunc = &ScreenBuffer::triangleRasterScanLine; }
-    if(rasterMode == TriangleRasterMethod::BOUNDING_BOX){ triDrFunc = &ScreenBuffer::triangleRasterBoundingBox; }
+    //triangle draw function (no zbuffer)
+    void (*drawTriangle)(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, uint32_t color);
+    if(rasterMode == TriangleRasterMethod::SCANLINE) drawTriangle = triangleRasterScanLine; 
+    if(rasterMode == TriangleRasterMethod::BOUNDING_BOX) drawTriangle = &triangleRasterBoundingBox;
 
+    //triangle draw function (with zbuffer)
+    void (*drawTriangleZBuffer)(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, uint32_t color);
+    if(rasterMode == TriangleRasterMethod::SCANLINE) drawTriangleZBuffer = triangleRasterScanLine_ZBuffered;
+    if(rasterMode == TriangleRasterMethod::BOUNDING_BOX) drawTriangleZBuffer = triangleRasterBoundingBoxZBuffered;
 
 
     int draw_count, all_count;
         
-        draw_count = 0;
-        all_count = 0;
+    draw_count = 0;
+    all_count = 0;
 
-        std::vector<Triangle> modified_tris;
-        if(renderMode == RenderMode::RENDER_PAINTERS){
-            modified_tris = tris;
+    Vector3d camLoc = camera.position;
+    float intensity;
 
 
-            Vector3d camLoc = camera.position;
-            if( projectionMode == ProjectionMode::PROJ_ORTHOGRAPHIC){
+        if( projectionMode == ProjectionMode::PROJ_ORTHOGRAPHIC){
 
-                //not using origin point might cause problem
-                camLoc = camLoc + camera.getDirection() * -orthographicHurlUnit;
-            }
-            std::sort(modified_tris.begin(), modified_tris.end(), TriangleDistanceComparator(camLoc));
-        }
-        else{
-            modified_tris = std::move(tris);
+            //not using origin point might cause problem
+            camLoc = camLoc + camera.getDirection() * -orthographicHurlUnit;
         }
 
-        for(Triangle t: modified_tris){
+    std::vector<Triangle> modified_tris;
+    if(renderMode == RenderMode::RENDER_PAINTERS){
+        modified_tris = tris;
 
-            all_count++;
+        std::sort(modified_tris.begin(), modified_tris.end(), TriangleDistanceComparator(camLoc));
+    }
+    else{
+        modified_tris = std::move(tris); 
+    }
 
-            if(backfaceCulling){
-                if(camera.getDirection().dot(t.Normal()) >= 0){ continue; }
-            }
+    for(Triangle t: modified_tris){
 
-            Vector2di p1, p2, p3;
-            p1 = projFun(t.v1, camera, screenBuffer);
-            p2 = projFun(t.v2, camera, screenBuffer);
-            p3 = projFun(t.v3, camera, screenBuffer);
+        all_count++;
 
-            //placeholder code until I decide how to handle loose vertexes
-            if(renderMode == RenderMode::RENDER_WIREFRAME){
-
-                screenBuffer.line(p1.x, p1.y, p2.x, p2.y, 0xFFFFFFFF);
-                screenBuffer.line(p2.x, p2.y, p3.x, p3.y, 0xFFFFFFFF);
-                screenBuffer.line(p3.x, p3.y, p1.x, p1.y, 0xFFFFFFFF);
-            }
-            if(renderMode == RenderMode::RENDER_NO_DEPTH || renderMode == RenderMode::RENDER_PAINTERS){
-
-                uint8_t r, g, b;
-
-                if(lightMode == LightMode::LAMBERTIAN_SHADE){
-                    globalLambertLight.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
-                    float intensity = computeLambertLighting(t, globalLambertLight);
-                    r = intensity * 255;
-                    g = r;
-                    b = r;
-                }
-
-
-                uint32_t color = packARGB(255, r, g, b);
-                if(lightMode == LightMode::RANDOM_COLOR){
-                    color = t.color;
-                }
-
-
-
-
-                (screenBuffer.*triDrFunc)(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, color);
-            }
-
-
-            draw_count++;
-        } 
+        if(backfaceCulling){
+            if(camera.getDirection().dot(t.Normal()) >= 0.1){ continue; }
+        }
         
+        draw_count++;
+
+        ScreenPoint p1, p2, p3;
+        p1 = project(t.v1, camera, screenBuffer);
+        p2 = project(t.v2, camera, screenBuffer);
+        p3 = project(t.v3, camera, screenBuffer);
+        
+
+        if(renderMode == RenderMode::RENDER_WIREFRAME){
+            drawLine(p1.x, p1.y, p2.x, p2.y, screenBuffer, 0xFFFFFFFF);
+            drawLine(p2.x, p2.y, p3.x, p3.y, screenBuffer, 0xFFFFFFFF);
+            drawLine(p3.x, p3.y, p1.x, p1.y, screenBuffer, 0xFFFFFFFF);
+            continue;
+        }
+
+        //solid lights and color
+        int a, r, g, b;
+        if(colorMode == ColorMode::RANDOM_COLOR){
+            a = t.a;
+            r = t.r;
+            g = t.g;
+            b = t.b;
+        }
+        else if(colorMode == ColorMode::SOLID_WHITE){
+            a = 255;
+            r = 255;
+            g = 255;
+            b = 255;
+        }
+        if(lightMode == LightMode::LAMBERTIAN_SHADE){
+            intensity = computeLambertLighting(t, globalLambertLight);
+            r *= intensity;
+            g *= intensity;
+            b *= intensity;
+        }
+        uint32_t color = packARGB(a, r, g, b);
+
+        if(renderMode == RenderMode::RENDER_ZBUFFER_MODEL || renderMode == RenderMode::RENDER_ZBUFFER_BUFFER){
+            drawTriangleZBuffer(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p1.z, p2.z, p3.z, screenBuffer, color);
+            continue;            
+        }        
+
+    }
+
+
+    if(renderMode == RenderMode::RENDER_ZBUFFER_BUFFER){
+        for(int i = 0; i < screenBuffer.buffer.size(); i++){
+            float z = screenBuffer.zBuffer[i];
+            if(z > ZDEPTH_VISIBLE * 2){ screenBuffer.buffer[i] = 0; continue; }
+            float zNorm = 1 - z / ZDEPTH_VISIBLE; // I WILL put MAGIC NUMBERS in code
+            
+            screenBuffer.buffer[i] = packARGB(255, 255 * zNorm, 255 * zNorm, 255 * zNorm);
+        }
+    }
 
 }
 
@@ -701,7 +849,7 @@ int main() {
     std::vector<std::vector<Triangle>> models;
 
 
-    tris = loadOBJ("diablo3_pos.obj");
+    tris = loadOBJ("suzanne.obj");
 
 
     models.push_back(tris);
