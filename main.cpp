@@ -36,7 +36,7 @@ enum LightMode
 {
     CONSTANT,
     PHONG,
-    LAMBERTIAN_SHADE
+    SIMPLE_LAMBERT
 };
 
 enum ColorMode
@@ -48,9 +48,9 @@ enum ColorMode
 
 //default options
 ProjectionMode projectionMode = ProjectionMode::PROJ_ORTHOGRAPHIC;
-RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
-TriangleRasterMethod rasterMode = TriangleRasterMethod::BOUNDING_BOX;
-LightMode lightMode = LightMode::CONSTANT;
+RenderMode renderMode = RenderMode::RENDER_PAINTERS;
+TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
+LightMode lightMode = LightMode::SIMPLE_LAMBERT;
 ColorMode colorMode = ColorMode::RANDOM_COLOR;
 bool backfaceCulling = false;
 
@@ -126,7 +126,7 @@ struct ScreenBuffer
     }
 
     bool updateZBuffer(int x, int y, float val){
-        if(getZBuffer(x, y) < val){ return false; }
+        if(getZBuffer(x, y) <= val){ return false; }
         setZBuffer(x, y, val);
         return true;
     }
@@ -212,7 +212,7 @@ void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, Scre
         }
 }
 
-
+//not working
 void triangleRasterScanLine_ZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, u_int32_t color) {
         
         double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
@@ -730,7 +730,7 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
     screenBuffer.fill(0);
     screenBuffer.drainZBuffer();
 
-    if(lightMode == LightMode::LAMBERTIAN_SHADE) {
+    if(lightMode == LightMode::SIMPLE_LAMBERT) {
         globalLambertLight.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
     }
 
@@ -813,7 +813,7 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
             g = 255;
             b = 255;
         }
-        if(lightMode == LightMode::LAMBERTIAN_SHADE){
+        if(lightMode == LightMode::SIMPLE_LAMBERT){
             intensity = computeLambertLighting(t, globalLambertLight);
             r *= intensity;
             g *= intensity;
@@ -825,15 +825,19 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
             drawTriangleZBuffer(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p1.z, p2.z, p3.z, screenBuffer, color);
             continue;            
         }        
+        if(renderMode == RenderMode::RENDER_PAINTERS || renderMode == RenderMode::RENDER_NO_DEPTH){
+            drawTriangle(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, screenBuffer, color);
+        }
 
     }
 
 
     if(renderMode == RenderMode::RENDER_ZBUFFER_BUFFER){
+        float minz = *std::min_element(screenBuffer.zBuffer.begin(), screenBuffer.zBuffer.end());
         for(int i = 0; i < screenBuffer.buffer.size(); i++){
             float z = screenBuffer.zBuffer[i];
-            if(z > ZDEPTH_VISIBLE * 2){ screenBuffer.buffer[i] = 0; continue; }
-            float zNorm = 1 - z / ZDEPTH_VISIBLE; // I WILL put MAGIC NUMBERS in code
+            if(z > minz + ZDEPTH_VISIBLE){ screenBuffer.buffer[i] = 0; continue; }
+            float zNorm = 1 - (z - minz)/ (ZDEPTH_VISIBLE - minz); // I WILL put MAGIC NUMBERS in code
             
             screenBuffer.buffer[i] = packARGB(255, 255 * zNorm, 255 * zNorm, 255 * zNorm);
         }
@@ -843,13 +847,13 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
 
 int main() {
 
-    ScreenBuffer screenBuffer(800, 800);
+    ScreenBuffer screenBuffer(1000, 1000);
     
     std::vector<Triangle> tris;
     std::vector<std::vector<Triangle>> models;
 
 
-    tris = loadOBJ("suzanne.obj");
+    tris = loadOBJ("diablo3_pos.obj");
 
 
     models.push_back(tris);
