@@ -8,8 +8,10 @@
 #include <bits/stdc++.h>
 #include <OBJ_Loader.h>
 
-const float FLOAT_MAX = 1000.0f; //not the max, but a usable amount
-const float ZDEPTH_VISIBLE = 3.0f;
+const float FLOAT_MAX = 100000.0f; //not the max, but a usable amount
+const float ZDEPTH_VISIBLE = 0.4f;
+const float ZDEPTH_BIAS = 0.0f;
+const int orthographicHurlUnit = 1000; //camera position is moved back by this amount to simulate a far away camera 
 
 enum ProjectionMode
 {
@@ -46,15 +48,21 @@ enum ColorMode
     TEXTURE
 };
 
+enum ShadeMode
+{
+    FLAT,
+    SMOOTH
+};
+
 //default options
-ProjectionMode projectionMode = ProjectionMode::PROJ_ORTHOGRAPHIC;
-RenderMode renderMode = RenderMode::RENDER_PAINTERS;
-TriangleRasterMethod rasterMode = TriangleRasterMethod::SCANLINE;
+ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
+RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
+TriangleRasterMethod rasterMode = TriangleRasterMethod::BOUNDING_BOX;
 LightMode lightMode = LightMode::SIMPLE_LAMBERT;
-ColorMode colorMode = ColorMode::RANDOM_COLOR;
+ColorMode colorMode = ColorMode::SOLID_WHITE;
+ShadeMode shadeMode = ShadeMode::SMOOTH;
 bool backfaceCulling = false;
 
-int orthographicHurlUnit = 1000; //camera position is moved back by this amount to simulate a far away camera 
 
 
 //buffer input gets a seizure with these and I have no idea why
@@ -72,16 +80,22 @@ uint32_t packARGB(uint8_t a, uint8_t r, uint8_t g, uint8_t b) {
            (static_cast<uint32_t>(b));
 }
 
+double round_up(double value, int decimal_places) {
+    const double multiplier = std::pow(10.0, decimal_places);
+    return std::ceil(value * multiplier) / multiplier;
+}
+
 double signed_triangle_area(int ax, int ay, int bx, int by, int cx, int cy) {
     return .5*((by-ay)*(bx+ax) + (cy-by)*(cx+bx) + (ay-cy)*(ax+cx));
 }
+
 
 struct ScreenBuffer
 {
     // note to self: w of h/x of y
     // down growing
     std::vector<uint32_t> buffer;
-    std::vector<float> zBuffer;
+    std::vector<double> zBuffer;
     int width, height;
     float halfwidth, halfheight;
 
@@ -92,7 +106,7 @@ struct ScreenBuffer
         halfheight = height / 2;
         halfwidth = width / 2;
         buffer = std::vector<uint32_t>(width * height, 0);
-        zBuffer = std::vector<float>(width * height, FLOAT_MAX);
+        zBuffer = std::vector<double>(width * height, FLOAT_MAX);
     }
 
     void fill(uint32_t color){
@@ -115,7 +129,7 @@ struct ScreenBuffer
     }
 
     //boundry check too slow?
-    float getZBuffer(int x, int y){
+    double getZBuffer(int x, int y){
         if(x >= width || y>=height) return 0;
         return zBuffer[y * width + x];
     }
@@ -125,7 +139,7 @@ struct ScreenBuffer
         zBuffer[y * width + x] = val;
     }
 
-    bool updateZBuffer(int x, int y, float val){
+    bool updateZBuffer(int x, int y, double val){
         if(getZBuffer(x, y) <= val){ return false; }
         setZBuffer(x, y, val);
         return true;
@@ -185,7 +199,10 @@ void drawLine( int x0, int y0, int x1, int y1, ScreenBuffer &buffer, uint32_t co
         }
 }
 
-void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, u_int32_t color) {
+//currently takes no color from shader
+//do fix if you plan on showcasing
+void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, 
+    uint32_t (*color)(float, float, float) ) {
         // sort the vertices, a,b,c in ascending y order (bubblesort yay!)
         if (ay>by) { std::swap(ax, bx); std::swap(ay, by); }
         if (ay>cy) { std::swap(ax, cx); std::swap(ay, cy); }
@@ -198,7 +215,7 @@ void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, Scre
                 int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
                 int x2 = ax + ((bx - ax)*(y - ay)) / segment_height;
                 for (int x=std::min(x1,x2); x<std::max(x1,x2); x++)  // draw a horizontal line
-                    buffer.set(x, y, color);
+                    buffer.set(x, y, 0);
             }
         }
         if (by != cy) { // if the upper half is not degenerate
@@ -207,18 +224,19 @@ void triangleRasterScanLine(int ax, int ay, int bx, int by, int cx, int cy, Scre
                 int x1 = ax + ((cx - ax)*(y - ay)) / total_height;
                 int x2 = bx + ((cx - bx)*(y - by)) / segment_height;
                 for (int x=std::min(x1,x2); x<std::max(x1,x2); x++)  // draw a horizontal line
-                    buffer.set(x, y, color);
+                    buffer.set(x, y, 0);
             }
         }
 }
 
 //not working
-void triangleRasterScanLine_ZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, u_int32_t color) {
+void triangleRasterScanline_ZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, 
+    uint32_t (*color)(float, float, float)) {
         
         double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
 
-        //if (total_area<1) return;
-        //alt back face culling
+        if (total_area<1) return;
+        
 
         if (ay>by) { std::swap(ax, bx); std::swap(ay, by); std::swap(az, bz); }
         if (ay>cy) { std::swap(ax, cx); std::swap(ay, cy); std::swap(az, cz); }
@@ -236,8 +254,8 @@ void triangleRasterScanLine_ZBuffered(int ax, int ay, int bx, int by, int cx, in
                     double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
                     double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
 
-                    float z = (alpha * az + beta * bz + gamma * cz);
-                    if(buffer.updateZBuffer(x, y, z)){ buffer.set(x, y, color); }
+                    double z = (alpha * az + beta * bz + gamma * cz);
+                    if(buffer.updateZBuffer(x, y, z)){ buffer.set(x, y, color(alpha, beta, gamma)); }
                 }                    
             }
         }
@@ -251,8 +269,8 @@ void triangleRasterScanLine_ZBuffered(int ax, int ay, int bx, int by, int cx, in
                     double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
                     double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
 
-                    float z = (alpha * az + beta * bz + gamma * cz);
-                    if(buffer.updateZBuffer(x, y, z)){ buffer.set(x, y, color); } 
+                    double z = (alpha * az + beta * bz + gamma * cz);
+                    if(buffer.updateZBuffer(x, y, z)){ buffer.set(x, y, color(alpha, beta, gamma)); } 
                 }                   
             }
         }
@@ -260,7 +278,8 @@ void triangleRasterScanLine_ZBuffered(int ax, int ay, int bx, int by, int cx, in
 
 
 
-void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, uint32_t color) {
+void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, 
+    uint32_t (*color)(float, float, float)) {
         int bbminx = std::min(std::min(ax, bx), cx); // bounding box for the triangle
         int bbminy = std::min(std::min(ay, by), cy); // defined by its top left and bottom right corners
         int bbmaxx = std::max(std::max(ax, bx), cx);
@@ -276,34 +295,55 @@ void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, S
                 double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
                 double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
                 if (alpha<0 || beta<0 || gamma<0) continue; // negative barycentric coordinate => the pixel is outside the triangle
-                buffer.set(x, y, color);
+                buffer.set(x, y, color(alpha, beta, gamma));
             }
         }
     }
 
 
-void triangleRasterBoundingBoxZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, uint32_t color) {
+void triangleRasterBoundingBox_ZBuffered(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, 
+    uint32_t (*color)(float, float, float)) {
         int bbminx = std::min(std::min(ax, bx), cx); // bounding box for the triangle
         int bbminy = std::min(std::min(ay, by), cy); // defined by its top left and bottom right corners
         int bbmaxx = std::max(std::max(ax, bx), cx);
         int bbmaxy = std::max(std::max(ay, by), cy);
         double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
 
-    //he got tricked into thinking it would work this time!
-    //mint issue?
+        if(total_area<1) return; //IMPORTANT!! tiny triangles cause issues with z-buffer calculations, making them appear as lines through bigger faces
+
         #pragma omp parallel for
         for (int x=bbminx; x<=bbmaxx; x++) {
             for (int y=bbminy; y<=bbmaxy; y++) {
                 double alpha = signed_triangle_area(x, y, bx, by, cx, cy) / total_area;
                 double beta  = signed_triangle_area(x, y, cx, cy, ax, ay) / total_area;
                 double gamma = signed_triangle_area(x, y, ax, ay, bx, by) / total_area;
-                if (alpha<0 || beta<0 || gamma<0) continue; // negative barycentric coordinate => the pixel is outside the triangle
-                float z = (alpha * az + beta * bz + gamma * cz);
-                if(buffer.updateZBuffer(x, y, z)) buffer.set(x, y, color);
+                if (alpha<0.f || beta<0.f || gamma<0.f) continue; // negative barycentric coordinate => the pixel is outside the triangle
+                double z = 1/(alpha * az + beta * bz + gamma * cz);
+                if(buffer.updateZBuffer(x, y, z)) buffer.set(x, y, color(alpha, beta, gamma));
             }
         }
     }
 
+
+/*
+struct Fragment
+{
+    ScreenPoint p1, p2, p3;
+    std::vector<uint32_t> color;
+    Fragment(ScreenPoint po1, ScreenPoint po2, ScreenPoint po3){
+        p1 = po1;
+        p2 = po2;
+        p3 = po3;
+    
+        int bbminx = std::min(std::min(p1.x, p2.x), p3.x);
+        int bbminy = std::min(std::min(p1.y, p2.y), p3.y);
+        int bbmaxx = std::max(std::max(p1.x, p2.x), p3.x);
+        int bbmaxy = std::max(std::max(p1.y, p2.y), p3.y);
+    
+    
+    }
+};
+*/
 
 
 struct Vector2d
@@ -320,16 +360,15 @@ struct Vector2d
 struct ScreenPoint
 {
     int x, y;
-    float z;
-    ScreenPoint(int x = 0, int y = 0, float z = 0)
+    double z;
+    ScreenPoint(int x = 0, int y = 0, double z = 0)
     {
         this->x = x;
         this->y = y;
         this->z = z;
+        
     }
 };
-
-#include <cmath>
 
 struct Vector3d
 {
@@ -414,7 +453,7 @@ struct Vector3d
 
 struct Triangle
 {
-    Vector3d v1, v2, v3;
+    Vector3d v1, v2, v3, vn1, vn2, vn3;
     uint8_t a, r, g, b;
 
     Triangle()
@@ -426,6 +465,9 @@ struct Triangle
         r = SDL_rand(256);
         g = SDL_rand(256);
         b = SDL_rand(256);
+        vn1 = Vector3d();
+        vn2 = Vector3d();
+        vn3 = Vector3d();
     }
 
     Vector3d centroid() {
@@ -446,12 +488,15 @@ struct Triangle
 
 
 
+
 struct Camera
 {
     Vector3d position, rotation;
     float fov;    // for perspective
     float zoom;   // for zoom
     float aspect; // Aspect ratio (width / height)
+    float near;
+    float far;
 
     Camera()
     {
@@ -460,6 +505,8 @@ struct Camera
         fov = 1.0f;
         zoom = 80.0f;
         aspect = SCREEN_WIDTH / SCREEN_HEIGHT;
+        near = 0.0f;
+        far = 10.0f;
     }
 
     Vector3d getDirection() {
@@ -600,6 +647,18 @@ std::vector<Triangle> loadOBJ(const std::string& filename) {
                 tri.v2 = v2;
                 tri.v3 = v3;
 
+                tri.vn1.x = mesh.Vertices[i1].Normal.X;
+                tri.vn1.y = mesh.Vertices[i1].Normal.Y;
+                tri.vn1.z = mesh.Vertices[i1].Normal.Z;
+
+                tri.vn2.x = mesh.Vertices[i2].Normal.X;
+                tri.vn2.y = mesh.Vertices[i2].Normal.Y;
+                tri.vn2.z = mesh.Vertices[i2].Normal.Z;
+
+                tri.vn3.x = mesh.Vertices[i3].Normal.X;
+                tri.vn3.y = mesh.Vertices[i3].Normal.Y;
+                tri.vn3.z = mesh.Vertices[i3].Normal.Z;
+
                 triangles.push_back(tri);
 			}
     }
@@ -650,17 +709,7 @@ struct LambertLight {
     float intensity = 1.0;    // 0..1
 };
 
-float computeLambertLighting(Triangle& tri, const LambertLight& light) {
-    Vector3d n = tri.Normal();     // Surface normal
-    Vector3d l = light.direction;
 
-    float dotNL = n.dot(l);
-    float diffuse = std::max(0.0f, dotNL) * light.intensity;
-
-    // Add some ambient light so faces in shadow aren't pure black
-    float ambient = 0.2f;
-    return std::min(1.0f, ambient + diffuse);
-}
 LambertLight globalLambertLight;
 
 
@@ -683,6 +732,128 @@ struct TriangleDistanceComparator {
     }
 };
 
+
+namespace Shader
+{
+    Triangle* tri;
+    uint32_t solidColor, v1color, v2color, v3color;
+    float solidintensity, v1intensity, v2intensity, v3intensity;
+    int x, y;
+
+    LambertLight l_light;
+
+    uint32_t (*colorFunction)(int, int) = NULL;
+    uint32_t (*lightFunction)(int, int) = NULL; 
+
+    void init(){
+        tri = NULL;
+
+        solidColor = 0;
+        v1color = 0;
+        v2color = 0;
+        v3color = 0;
+
+        solidintensity = 0;
+        v1intensity = 0;
+        v2intensity = 0;
+        v3intensity = 0;
+
+        colorFunction = NULL;
+        lightFunction = NULL;
+        
+    }
+
+    uint32_t getFlatColor(float alpha, float beta, float gamma){
+        return solidColor;
+    }
+
+    uint32_t getSmoothColor(float alpha, float beta, float gamma){
+        float intensity = alpha * v1intensity + beta * v2intensity + gamma * v3intensity;
+        if(intensity > 1.0){ intensity = 1.0; }
+        if(intensity < 0.1){ intensity = 0.1; }
+
+        uint8_t r = (solidColor >> 16) & 0xFF;
+        uint8_t g = (solidColor >> 8) & 0xFF;
+        uint8_t b = solidColor & 0xFF;
+
+        // Apply shading
+        r = static_cast<uint8_t>(r * intensity);
+        g = static_cast<uint8_t>(g * intensity);
+        b = static_cast<uint8_t>(b * intensity);
+        return packARGB(255, r, g, b);
+    }
+
+    float computeLambertLighting(Vector3d normal) {
+        Vector3d n = normal;     // Surface normal
+        Vector3d l = l_light.direction;
+
+        float dotNL = n.dot(l);
+        float diffuse = std::max(0.0f, dotNL) * l_light.intensity;
+
+        // Add some ambient light so faces in shadow aren't pure black
+        float ambient = 0.2f;
+        return std::min(1.0f, ambient + diffuse);
+    }
+
+    void flatColorRun(){
+        int a, r, g, b;
+        if(colorMode == ColorMode::RANDOM_COLOR){
+            a = tri->a;
+            r = tri->r;
+            g = tri->g;
+            b = tri->b;
+        }
+        else if(colorMode == ColorMode::SOLID_WHITE){
+            a = 255;
+            r = 255;
+            g = 255;
+            b = 255;
+        }
+        if(lightMode == LightMode::SIMPLE_LAMBERT){
+            float intensity = Shader::computeLambertLighting(tri->Normal());
+            r *= intensity;
+            g *= intensity;
+            b *= intensity;
+        }
+        Shader::solidColor = packARGB(a, r, g, b);
+    }
+
+    void smoothColorRun(){
+        if(lightMode == LightMode::CONSTANT){
+            flatColorRun();
+            return;
+        }
+
+        int a, r, g, b;
+        float i1, i2, i3;
+        if(colorMode == ColorMode::RANDOM_COLOR){
+            a = tri->a;
+            r = tri->r;
+            g = tri->g;
+            b = tri->b;
+        }
+        else if(colorMode == ColorMode::SOLID_WHITE){
+            a = 255;
+            r = 255;
+            g = 255;
+            b = 255;
+        }
+        if(lightMode == LightMode::SIMPLE_LAMBERT){
+            v1intensity = Shader::computeLambertLighting(tri->vn1);
+            v2intensity = Shader::computeLambertLighting(tri->vn2);
+            v3intensity = Shader::computeLambertLighting(tri->vn3);
+        }
+        Shader::solidColor = packARGB(a, r, g, b);
+
+    }
+
+    void colorRun(){
+        if(shadeMode == ShadeMode::FLAT) flatColorRun();
+        else smoothColorRun();
+    }
+
+}
+
 ScreenPoint orthos(const Vector3d &point, const Camera &camera, const ScreenBuffer &screenBuffer) {
     ScreenPoint screenPoint;
 
@@ -695,7 +866,7 @@ ScreenPoint orthos(const Vector3d &point, const Camera &camera, const ScreenBuff
 
     screenPoint.x = static_cast<int>(rotatedPoint.x * camera.zoom * camera.aspect + screenBuffer.halfwidth); 
     screenPoint.y = static_cast<int>(-rotatedPoint.y * camera.zoom + screenBuffer.halfheight);
-    screenPoint.z = rotatedPoint.z; // depth in camera space
+    screenPoint.z = 1/((rotatedPoint.z - camera.near)/(camera.far - camera.near)); 
 
     return screenPoint;
 }
@@ -717,7 +888,7 @@ ScreenPoint pers(const Vector3d &point, const Camera &camera, const ScreenBuffer
 
     screenPoint.x = static_cast<int>(rotatedPoint.x * scale * camera.aspect * screenBuffer.halfwidth + screenBuffer.halfwidth);
     screenPoint.y = static_cast<int>(-rotatedPoint.y * scale * screenBuffer.halfheight + screenBuffer.halfheight);
-    screenPoint.z = rotatedPoint.z; // depth in camera space
+    screenPoint.z = 1/((rotatedPoint.z - camera.near)/(camera.far - camera.near)); 
 
     return screenPoint;
 }
@@ -729,6 +900,7 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
     //clear the screen
     screenBuffer.fill(0);
     screenBuffer.drainZBuffer();
+    
 
     if(lightMode == LightMode::SIMPLE_LAMBERT) {
         globalLambertLight.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
@@ -741,14 +913,21 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
     if(projectionMode == ProjectionMode::PROJ_PERSPECTIVE) project = pers;
 
     //triangle draw function (no zbuffer)
-    void (*drawTriangle)(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, uint32_t color);
+    void (*drawTriangle)(int ax, int ay, int bx, int by, int cx, int cy, ScreenBuffer &buffer, uint32_t (*color)(float, float, float));
     if(rasterMode == TriangleRasterMethod::SCANLINE) drawTriangle = triangleRasterScanLine; 
     if(rasterMode == TriangleRasterMethod::BOUNDING_BOX) drawTriangle = &triangleRasterBoundingBox;
 
     //triangle draw function (with zbuffer)
-    void (*drawTriangleZBuffer)(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, uint32_t color);
-    if(rasterMode == TriangleRasterMethod::SCANLINE) drawTriangleZBuffer = triangleRasterScanLine_ZBuffered;
-    if(rasterMode == TriangleRasterMethod::BOUNDING_BOX) drawTriangleZBuffer = triangleRasterBoundingBoxZBuffered;
+    void (*drawTriangleZBuffer)(int ax, int ay, int bx, int by, int cx, int cy, float az, float bz, float cz, ScreenBuffer &buffer, uint32_t (*color)(float, float, float));
+    if(rasterMode == TriangleRasterMethod::SCANLINE) drawTriangleZBuffer = triangleRasterScanline_ZBuffered;
+    if(rasterMode == TriangleRasterMethod::BOUNDING_BOX) drawTriangleZBuffer = triangleRasterBoundingBox_ZBuffered;
+
+    //color function
+    uint32_t (*colorFunction)(float, float, float);
+    if(colorMode != ColorMode::TEXTURE){
+        if(shadeMode == ShadeMode::FLAT) colorFunction = Shader::getFlatColor;
+        if(shadeMode == ShadeMode::SMOOTH) colorFunction = Shader::getSmoothColor;
+    } 
 
 
     int draw_count, all_count;
@@ -777,7 +956,6 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
     }
 
     for(Triangle t: modified_tris){
-
         all_count++;
 
         if(backfaceCulling){
@@ -785,6 +963,13 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
         }
         
         draw_count++;
+
+        //
+        Shader::init();
+        Shader::tri = &t;
+        Shader::colorRun();
+        //
+
 
         ScreenPoint p1, p2, p3;
         p1 = project(t.v1, camera, screenBuffer);
@@ -800,33 +985,14 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
         }
 
         //solid lights and color
-        int a, r, g, b;
-        if(colorMode == ColorMode::RANDOM_COLOR){
-            a = t.a;
-            r = t.r;
-            g = t.g;
-            b = t.b;
-        }
-        else if(colorMode == ColorMode::SOLID_WHITE){
-            a = 255;
-            r = 255;
-            g = 255;
-            b = 255;
-        }
-        if(lightMode == LightMode::SIMPLE_LAMBERT){
-            intensity = computeLambertLighting(t, globalLambertLight);
-            r *= intensity;
-            g *= intensity;
-            b *= intensity;
-        }
-        uint32_t color = packARGB(a, r, g, b);
+
 
         if(renderMode == RenderMode::RENDER_ZBUFFER_MODEL || renderMode == RenderMode::RENDER_ZBUFFER_BUFFER){
-            drawTriangleZBuffer(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p1.z, p2.z, p3.z, screenBuffer, color);
+            drawTriangleZBuffer(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, p1.z, p2.z, p3.z, screenBuffer, colorFunction);
             continue;            
         }        
         if(renderMode == RenderMode::RENDER_PAINTERS || renderMode == RenderMode::RENDER_NO_DEPTH){
-            drawTriangle(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, screenBuffer, color);
+            drawTriangle(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y, screenBuffer, colorFunction);
         }
 
     }
@@ -853,7 +1019,7 @@ int main() {
     std::vector<std::vector<Triangle>> models;
 
 
-    tris = loadOBJ("diablo3_pos.obj");
+    tris = loadOBJ("african_head.obj");
 
 
     models.push_back(tris);
@@ -926,6 +1092,11 @@ int main() {
 	    float delta = (end - start) / (float)SDL_GetPerformanceFrequency();
 
         mainCamera.orbitAroundPoint(Vector3d(), 0.4f * delta, 'y', true);
+        
+        //lambert rotation
+        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, -1, 0));
+        //Shader::l_light.direction.z -= 0.4;
+
 
         std::string title = "fps: " + std::to_string(1.0f / delta);
 	    SDL_SetWindowTitle(window , title.c_str());
