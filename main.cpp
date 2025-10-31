@@ -58,7 +58,7 @@ enum ShadeMode
 ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
 RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::BOUNDING_BOX;
-LightMode lightMode = LightMode::SIMPLE_LAMBERT;
+LightMode lightMode = LightMode::PHONG;
 ColorMode colorMode = ColorMode::SOLID_WHITE;
 ShadeMode shadeMode = ShadeMode::SMOOTH;
 bool backfaceCulling = false;
@@ -568,6 +568,10 @@ struct Camera
 
 };
 
+//maincamera my beloved
+Camera mainCamera;
+
+
 
 
 std::vector<Triangle> loadTRIS(const std::string &filename)
@@ -735,6 +739,13 @@ struct TriangleDistanceComparator {
 
 namespace Shader
 {
+    //Phong model values
+    float ambientCFF = 0.1f;
+    float diffuseCFF = 0.8f;
+    float specularCFF = 0.3f;
+    float shininess = 32.0f;
+
+
     Triangle* tri;
     uint32_t solidColor, v1color, v2color, v3color;
     float solidintensity, v1intensity, v2intensity, v3intensity;
@@ -763,12 +774,68 @@ namespace Shader
         
     }
 
+    float computePhongLighting(float alpha, float beta, float gamma){
+        uint8_t A = (solidColor >> 24) & 0xFF;
+        uint8_t R = (solidColor >> 16) & 0xFF;
+        uint8_t G = (solidColor >> 8) & 0xFF;
+        uint8_t B = (solidColor) & 0xFF;
+
+        // Normalize RGB to [0,1]
+        Vector3d baseColor(R / 255.0f, G / 255.0f, B / 255.0f);
+
+        //Interpolate vertex normals using barycentrics
+        Vector3d interpolatedNormal =
+            (tri->vn1 * alpha +
+            tri->vn2 * beta +
+            tri->vn3 * gamma);
+
+        //Normalize light and view vectors
+        Vector3d N = interpolatedNormal.normalized();
+        Vector3d L = l_light.direction.normalized();
+        Vector3d V = mainCamera.getDirection();
+
+        float ambient = ambientCFF;
+
+        float NdotL = std::max(0.0f, N.dot(L));
+        float diffuse = diffuseCFF * NdotL;
+
+        Vector3d reflection = (N * (2.0f * NdotL) - L).normalized();
+        float RdotV = std::max(0.0f, reflection.dot(V));
+        float specular = specularCFF * std::pow(shininess, RdotV);
+
+        float intensity = ambient + diffuse + specular;
+        if (intensity > 1.0f) intensity = 1.0f;
+
+        return intensity;
+    }
+
+    float computeLambertLighting(Vector3d normal) {
+        Vector3d n = normal;     // Surface normal
+        Vector3d l = l_light.direction;
+
+        float dotNL = n.dot(l);
+        float diffuse = std::max(0.0f, dotNL) * l_light.intensity;
+
+        // Add some ambient light so faces in shadow aren't pure black
+        float ambient = 0.2f;
+        return std::min(1.0f, ambient + diffuse);
+    }
+
+
     uint32_t getFlatColor(float alpha, float beta, float gamma){
         return solidColor;
     }
 
     uint32_t getSmoothColor(float alpha, float beta, float gamma){
-        float intensity = alpha * v1intensity + beta * v2intensity + gamma * v3intensity;
+        float intensity;
+        
+        if(lightMode == LightMode::SIMPLE_LAMBERT){
+            intensity = alpha * v1intensity + beta * v2intensity + gamma * v3intensity;       
+        }
+        else if(lightMode == LightMode::PHONG){
+            intensity = computePhongLighting(alpha, beta, gamma);
+        }
+
         if(intensity > 1.0){ intensity = 1.0; }
         if(intensity < 0.1){ intensity = 0.1; }
 
@@ -783,17 +850,6 @@ namespace Shader
         return packARGB(255, r, g, b);
     }
 
-    float computeLambertLighting(Vector3d normal) {
-        Vector3d n = normal;     // Surface normal
-        Vector3d l = l_light.direction;
-
-        float dotNL = n.dot(l);
-        float diffuse = std::max(0.0f, dotNL) * l_light.intensity;
-
-        // Add some ambient light so faces in shadow aren't pure black
-        float ambient = 0.2f;
-        return std::min(1.0f, ambient + diffuse);
-    }
 
     void flatColorRun(){
         int a, r, g, b;
@@ -903,7 +959,7 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
     
 
     if(lightMode == LightMode::SIMPLE_LAMBERT) {
-        globalLambertLight.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
+        Shader::l_light.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
     }
 
 
@@ -1018,18 +1074,15 @@ int main() {
     std::vector<Triangle> tris;
     std::vector<std::vector<Triangle>> models;
 
+    mainCamera.aspect = screenBuffer.width / screenBuffer.height;
+    mainCamera.zoom = 250.0f;
+    mainCamera.position.y = 0;
+    mainCamera.position.z = -2;
 
     tris = loadOBJ("african_head.obj");
 
 
     models.push_back(tris);
-
-    Camera mainCamera;
-    mainCamera.aspect = screenBuffer.width / screenBuffer.height;
-    mainCamera.zoom = 250.0f;
-    mainCamera.position.y = 0;
-    mainCamera.position.z = -2;
-    
 
     SDL_Window* window = SDL_CreateWindow("Hello SDL3",
                                           screenBuffer.width, screenBuffer.height, 0);
@@ -1094,7 +1147,7 @@ int main() {
         mainCamera.orbitAroundPoint(Vector3d(), 0.4f * delta, 'y', true);
         
         //lambert rotation
-        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, -1, 0));
+        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, -0.5, 0));
         //Shader::l_light.direction.z -= 0.4;
 
 
