@@ -7,6 +7,11 @@
 #include <string>
 #include <bits/stdc++.h>
 #include <OBJ_Loader.h>
+#include "tgaimage.hpp"
+
+//right hand
+//z forward
+//y up
 
 const float FLOAT_MAX = 100000.0f; //not the max, but a usable amount
 const float ZDEPTH_VISIBLE = 0.4f;
@@ -54,13 +59,20 @@ enum ShadeMode
     SMOOTH
 };
 
+enum AlphaMode
+{
+    NO_ALPHA_MAPPING,
+    ALPHA_MAPPING
+};
+
 //default options
 ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
 RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::BOUNDING_BOX;
 LightMode lightMode = LightMode::PHONG;
-ColorMode colorMode = ColorMode::SOLID_WHITE;
+ColorMode colorMode = ColorMode::TEXTURE;
 ShadeMode shadeMode = ShadeMode::SMOOTH;
+AlphaMode alphaMode = AlphaMode::ALPHA_MAPPING;
 bool backfaceCulling = false;
 
 
@@ -309,7 +321,7 @@ void triangleRasterBoundingBox_ZBuffered(int ax, int ay, int bx, int by, int cx,
         int bbmaxy = std::max(std::max(ay, by), cy);
         double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
 
-        if(total_area<1) return; //IMPORTANT!! tiny triangles cause issues with z-buffer calculations, making them appear as lines through bigger faces
+        if(total_area<1.0) return; //IMPORTANT!! tiny triangles cause issues with z-buffer calculations, making them appear as lines through bigger faces
 
         #pragma omp parallel for
         for (int x=bbminx; x<=bbmaxx; x++) {
@@ -453,7 +465,8 @@ struct Vector3d
 
 struct Triangle
 {
-    Vector3d v1, v2, v3, vn1, vn2, vn3;
+    Vector3d v1, v2, v3, vn1, vn2, vn3, tangent, bitangent;
+    float uv1x, uv1y, uv2x, uv2y, uv3x, uv3y;
     uint8_t a, r, g, b;
 
     Triangle()
@@ -484,6 +497,7 @@ struct Triangle
     }
 
 
+
 };
 
 
@@ -509,58 +523,46 @@ struct Camera
         far = 10.0f;
     }
 
+
     Vector3d getDirection() {
         float cosPitch = std::cos(rotation.x);
         float sinPitch = std::sin(rotation.x);
         float cosYaw   = std::cos(rotation.y);
         float sinYaw   = std::sin(rotation.y);
 
-        return {
-            cosPitch * sinYaw,  // x
-            -sinPitch,          // y (note: depends on convention)
-            cosPitch * cosYaw   // z
-        };
-        //is this normalized?
+        return Vector3d(cosPitch * sinYaw, -sinPitch, cosYaw * cosPitch);
+        
     }
 
-    void orbitAroundPoint(const Vector3d& target, float angle, char axis, bool keepFacing) {
-    //funnily enough, orbiting x causes a sin motion which while not intended, is pretty useful
-
-
-    // Translate to target-relative coordinates
+void orbitAroundPoint(const Vector3d& target, float amount, const Vector3d& axis, bool keepFacing)
+{
+    // 1️⃣ Translate camera position so the target is at origin
     Vector3d relative = position - target;
 
-    // Rotate around chosen axis
-    float c = std::cos(angle);
-    float s = std::sin(angle);
-    Vector3d rotated = relative;
+    // 2️⃣ Normalize axis to ensure correct rotation
+    Vector3d nAxis = axis.normalized();
+    float c = std::cos(amount);
+    float s = std::sin(amount);
 
-    switch (axis) {
-        case 'x': // rotate around X-axis
-            rotated.y = relative.y * c - relative.z * s;
-            rotated.z = relative.y * s + relative.z * c;
-            break;
-        case 'y': // rotate around Y-axis
-            rotated.x = relative.x * c + relative.z * s;
-            rotated.z = -relative.x * s + relative.z * c;
-            break;
-        case 'z': // rotate around Z-axis
-            rotated.x = relative.x * c - relative.y * s;
-            rotated.y = relative.x * s + relative.y * c;
-            break;
-    }
+    // 3️⃣ Rodrigues' rotation formula
+    // Rotated = relative * cos(θ) + (n × relative) * sin(θ) + n * (n ⋅ relative) * (1 - cos(θ))
+    Vector3d rotated =
+        relative * c +
+        nAxis.cross(relative) * s +
+        nAxis * (nAxis.dot(relative)) * (1.0f - c);
 
-    // Update position
+    // 4️⃣ Update position in world space
     position = target + rotated;
 
-    // If keepFacing is true, make camera look at target
-    if (keepFacing) {
+    // 5️⃣ Optionally make the camera keep looking at the target
+    if (keepFacing)
+    {
         Vector3d dir = (target - position).normalized();
 
-        // Extract yaw and pitch from direction
-        rotation.y = std::atan2(dir.x, dir.z);       // yaw
-        rotation.x = std::asin(-dir.y);              // pitch
-        // leave rotation.z (roll) unchanged
+        // Derive rotation angles from direction vector
+        rotation.y = std::atan2(dir.x, dir.z);  // yaw
+        rotation.x = std::asin(-dir.y);         // pitch
+        // rotation.z unchanged (roll)
     }
 }
 
@@ -608,19 +610,14 @@ std::vector<Triangle> loadTRIS(const std::string &filename)
     return triangles;
 }
 
-std::vector<Triangle> loadOBJ(const std::string& filename) {
-    std::vector<Triangle> triangles;
-
+void loadOBJ(const std::string& filename, std::vector<Triangle>& tris){
 
     //probably objl can be modified to use local types to remove some overhead
     objl::Loader loader;
-    std::ifstream file(filename);
-
 
     bool isLoaded = loader.LoadFile(filename);
     if(!isLoaded){
         SDL_Log("failed to load OBJ file");
-        return triangles;
     }
 
 
@@ -663,12 +660,47 @@ std::vector<Triangle> loadOBJ(const std::string& filename) {
                 tri.vn3.y = mesh.Vertices[i3].Normal.Y;
                 tri.vn3.z = mesh.Vertices[i3].Normal.Z;
 
-                triangles.push_back(tri);
+                tri.uv1x = mesh.Vertices[i1].TextureCoordinate.X;
+                tri.uv1y = mesh.Vertices[i1].TextureCoordinate.Y;
+
+                tri.uv2x = mesh.Vertices[i2].TextureCoordinate.X;
+                tri.uv2y = mesh.Vertices[i2].TextureCoordinate.Y;
+
+                tri.uv3x = mesh.Vertices[i3].TextureCoordinate.X;
+                tri.uv3y = mesh.Vertices[i3].TextureCoordinate.Y;
+
+
+
+                Vector3d edge1 = tri.v2 - tri.v1;
+                Vector3d edge2 = tri.v3 - tri.v1;
+
+                float du1 = tri.uv2x - tri.uv1x;
+                float dv1 = tri.uv2y - tri.uv1y;
+                float du2 = tri.uv3x - tri.uv1x;
+                float dv2 = tri.uv3y - tri.uv1y;
+
+                float f = 1.0f / (du1 * dv2 - du2 * dv1);
+
+                tri.tangent = Vector3d(
+                    f * (dv2 * edge1.x - dv1 * edge2.x),
+                    f * (dv2 * edge1.y - dv1 * edge2.y),
+                    f * (dv2 * edge1.z - dv1 * edge2.z)
+                );
+
+                tri.bitangent = Vector3d(
+                    f * (-du2 * edge1.x + du1 * edge2.x),
+                    f * (-du2 * edge1.y + du1 * edge2.y),
+                    f * (-du2 * edge1.z + du1 * edge2.z)
+                );
+
+                tri.tangent = tri.tangent.normalized();
+                tri.bitangent = tri.bitangent.normalized();
+
+                tris.push_back(tri);
 			}
+
     }
-
-
-    return triangles;
+    std::cout <<"done" << std::endl;
 }
 
 
@@ -743,8 +775,10 @@ namespace Shader
     float ambientCFF = 0.1f;
     float diffuseCFF = 0.8f;
     float specularCFF = 0.3f;
-    float shininess = 32.0f;
+    float shininess = 215.0f;
 
+    TGAImage normalMap;
+    TGAImage texture;
 
     Triangle* tri;
     uint32_t solidColor, v1color, v2color, v3color;
@@ -774,6 +808,54 @@ namespace Shader
         
     }
 
+    Vector3d calculateNormal(float alpha, float beta, float gamma){
+            
+        // --- Interpolate UV ---
+        float u = alpha * tri->uv1x + beta * tri->uv2x + gamma * tri->uv3x;
+        float v = alpha * tri->uv1y + beta * tri->uv2y + gamma * tri->uv3y;
+
+        // Fix OBJ->TGA mismatch: flip V
+        v = 1.0f - v;
+
+        int px = u * normalMap.width();
+        int py = v * normalMap.height();
+
+        TGAColor pixel = normalMap.get(px, py);
+
+        // Convert normal map (TGA is BGRA)
+        float nx = (pixel.bgra[2] / 255.0f) * 2.0f - 1.0f;
+        float ny = (pixel.bgra[1] / 255.0f) * 2.0f - 1.0f;
+        float nz = (pixel.bgra[0] / 255.0f) * 2.0f - 1.0f;
+
+        Vector3d tangentSpaceNormal(nx, ny, nz);
+        tangentSpaceNormal = tangentSpaceNormal.normalized();
+
+        // Interpolate vertex normal
+        Vector3d normal =
+            tri->vn1 * alpha +
+            tri->vn2 * beta +
+            tri->vn3 * gamma;
+        normal = normal.normalized();
+
+        // Build TBN
+        Vector3d T = tri->tangent;
+        T = (T - normal * normal.dot(T)).normalized();
+
+        Vector3d B = normal.cross(T);
+
+        // Correct for V-flip
+        //if (normalMap.flippedVertically)
+        B = B * -1.0f;
+
+        // Transform TS normal to world space
+        Vector3d worldNormal =
+            T * tangentSpaceNormal.x +
+            B * tangentSpaceNormal.y +
+            normal * tangentSpaceNormal.z;
+
+        return worldNormal.normalized();
+    }
+
     float computePhongLighting(float alpha, float beta, float gamma){
         uint8_t A = (solidColor >> 24) & 0xFF;
         uint8_t R = (solidColor >> 16) & 0xFF;
@@ -784,10 +866,16 @@ namespace Shader
         Vector3d baseColor(R / 255.0f, G / 255.0f, B / 255.0f);
 
         //Interpolate vertex normals using barycentrics
-        Vector3d interpolatedNormal =
+        Vector3d interpolatedNormal; 
+        
+        if(alphaMode == AlphaMode::NO_ALPHA_MAPPING)
+            interpolatedNormal =
             (tri->vn1 * alpha +
             tri->vn2 * beta +
             tri->vn3 * gamma);
+        else{
+            interpolatedNormal = calculateNormal(alpha, beta, gamma);
+        }
 
         //Normalize light and view vectors
         Vector3d N = interpolatedNormal.normalized();
@@ -801,11 +889,10 @@ namespace Shader
 
         Vector3d reflection = (N * (2.0f * NdotL) - L).normalized();
         float RdotV = std::max(0.0f, reflection.dot(V));
-        float specular = specularCFF * std::pow(shininess, RdotV);
+        float specular = specularCFF * std::pow(RdotV, shininess);
 
         float intensity = ambient + diffuse + specular;
         if (intensity > 1.0f) intensity = 1.0f;
-
         return intensity;
     }
 
@@ -817,12 +904,28 @@ namespace Shader
         float diffuse = std::max(0.0f, dotNL) * l_light.intensity;
 
         // Add some ambient light so faces in shadow aren't pure black
-        float ambient = 0.2f;
+        float ambient = 0.0f;
         return std::min(1.0f, ambient + diffuse);
     }
 
+    uint32_t getTextureColor(float alpha, float beta, float gamma){
+        // --- Interpolate UV ---
+        
+        float u = alpha * tri->uv1x + beta * tri->uv2x + gamma * tri->uv3x;
+        float v = alpha * tri->uv1y + beta * tri->uv2y + gamma * tri->uv3y;
+
+        v = 1.0f - v;
+
+        int px = u * texture.width();
+        int py = v * texture.height();
+
+        TGAColor pixel = texture.get(px, py);
+        uint32_t color = packARGB(255, pixel.bgra[2], pixel.bgra[1], pixel.bgra[0]);
+        return color;
+    }
 
     uint32_t getFlatColor(float alpha, float beta, float gamma){
+        if(colorMode == ColorMode::TEXTURE) return getTextureColor(alpha, beta, gamma);
         return solidColor;
     }
 
@@ -835,13 +938,28 @@ namespace Shader
         else if(lightMode == LightMode::PHONG){
             intensity = computePhongLighting(alpha, beta, gamma);
         }
+        else{
+            intensity = 1.0;
+        }
 
         if(intensity > 1.0){ intensity = 1.0; }
         if(intensity < 0.1){ intensity = 0.1; }
 
-        uint8_t r = (solidColor >> 16) & 0xFF;
-        uint8_t g = (solidColor >> 8) & 0xFF;
-        uint8_t b = solidColor & 0xFF;
+        uint32_t color;
+        if(colorMode == ColorMode::TEXTURE){
+            color = getTextureColor(alpha, beta, gamma); 
+        }
+        else{
+            color = solidColor;
+        }
+
+        uint8_t r = (color >> 16) & 0xFF;
+        uint8_t g = (color >> 8) & 0xFF;
+        uint8_t b = color & 0xFF;
+
+
+
+
 
         // Apply shading
         r = static_cast<uint8_t>(r * intensity);
@@ -958,9 +1076,7 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
     screenBuffer.drainZBuffer();
     
 
-    if(lightMode == LightMode::SIMPLE_LAMBERT) {
-        Shader::l_light.direction = camera.getDirection().rotateByAngle(Vector3d(0, 1, 0), 2.0).normalized();
-    }
+    
 
 
     //projection function
@@ -980,10 +1096,8 @@ void renderFrame(ScreenBuffer &screenBuffer, Camera &camera, const std::vector<T
 
     //color function
     uint32_t (*colorFunction)(float, float, float);
-    if(colorMode != ColorMode::TEXTURE){
         if(shadeMode == ShadeMode::FLAT) colorFunction = Shader::getFlatColor;
         if(shadeMode == ShadeMode::SMOOTH) colorFunction = Shader::getSmoothColor;
-    } 
 
 
     int draw_count, all_count;
@@ -1074,13 +1188,22 @@ int main() {
     std::vector<Triangle> tris;
     std::vector<std::vector<Triangle>> models;
 
+
+    std::string obj_name = "african_head";
+    loadOBJ(obj_name + ".obj", tris);
+
     mainCamera.aspect = screenBuffer.width / screenBuffer.height;
     mainCamera.zoom = 250.0f;
     mainCamera.position.y = 0;
     mainCamera.position.z = -2;
+    
+    if(alphaMode == AlphaMode::ALPHA_MAPPING){
+        Shader::normalMap.read_tga_file(obj_name + "_nm.tga");
+    }
 
-    tris = loadOBJ("african_head.obj");
-
+    if(colorMode == ColorMode::TEXTURE){
+        Shader::texture.read_tga_file(obj_name + "_diffuse.tga");
+    }
 
     models.push_back(tris);
 
@@ -1144,11 +1267,10 @@ int main() {
 
 	    float delta = (end - start) / (float)SDL_GetPerformanceFrequency();
 
-        mainCamera.orbitAroundPoint(Vector3d(), 0.4f * delta, 'y', true);
+        mainCamera.orbitAroundPoint(Vector3d(), 0.4f * delta, Vector3d(0, 1, 0), true);
+
+        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, 0.5, 0));
         
-        //lambert rotation
-        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, -0.5, 0));
-        //Shader::l_light.direction.z -= 0.4;
 
 
         std::string title = "fps: " + std::to_string(1.0f / delta);
