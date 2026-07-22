@@ -1,1 +1,2 @@
-you need SDL3 in vendored/ to compile this
+install SDL3 in vendored/
+build with CMake
