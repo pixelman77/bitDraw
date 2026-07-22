@@ -14,7 +14,7 @@
 //y up
 
 const float FLOAT_MAX = 100000.0f; //not the max, but a usable amount
-const float ZDEPTH_VISIBLE = 0.4f;
+const float ZDEPTH_VISIBLE = 0.3f;
 const float ZDEPTH_BIAS = 0.0f;
 const int orthographicHurlUnit = 1000; //camera position is moved back by this amount to simulate a far away camera 
 
@@ -70,9 +70,9 @@ ProjectionMode projectionMode = ProjectionMode::PROJ_PERSPECTIVE;
 RenderMode renderMode = RenderMode::RENDER_ZBUFFER_MODEL;
 TriangleRasterMethod rasterMode = TriangleRasterMethod::BOUNDING_BOX;
 LightMode lightMode = LightMode::PHONG;
-ColorMode colorMode = ColorMode::TEXTURE;
+ColorMode colorMode = ColorMode::SOLID_WHITE;
 ShadeMode shadeMode = ShadeMode::SMOOTH;
-AlphaMode alphaMode = AlphaMode::ALPHA_MAPPING;
+AlphaMode alphaMode = AlphaMode::NO_ALPHA_MAPPING;
 bool backfaceCulling = false;
 
 
@@ -298,8 +298,7 @@ void triangleRasterBoundingBox(int ax, int ay, int bx, int by, int cx, int cy, S
         int bbmaxy = std::max(std::max(ay, by), cy);
         double total_area = signed_triangle_area(ax, ay, bx, by, cx, cy);
 
-    //he got tricked into thinking it would work this time!
-    //mint issue?
+
         #pragma omp parallel for
         for (int x=bbminx; x<=bbmaxx; x++) {
             for (int y=bbminy; y<=bbmaxy; y++) {
@@ -536,25 +535,20 @@ struct Camera
 
 void orbitAroundPoint(const Vector3d& target, float amount, const Vector3d& axis, bool keepFacing)
 {
-    // 1️⃣ Translate camera position so the target is at origin
     Vector3d relative = position - target;
 
-    // 2️⃣ Normalize axis to ensure correct rotation
     Vector3d nAxis = axis.normalized();
     float c = std::cos(amount);
     float s = std::sin(amount);
 
-    // 3️⃣ Rodrigues' rotation formula
     // Rotated = relative * cos(θ) + (n × relative) * sin(θ) + n * (n ⋅ relative) * (1 - cos(θ))
     Vector3d rotated =
         relative * c +
         nAxis.cross(relative) * s +
         nAxis * (nAxis.dot(relative)) * (1.0f - c);
 
-    // 4️⃣ Update position in world space
     position = target + rotated;
 
-    // 5️⃣ Optionally make the camera keep looking at the target
     if (keepFacing)
     {
         Vector3d dir = (target - position).normalized();
@@ -775,7 +769,7 @@ namespace Shader
     float ambientCFF = 0.1f;
     float diffuseCFF = 0.8f;
     float specularCFF = 0.3f;
-    float shininess = 215.0f;
+    float shininess = 212.0f;
 
     TGAImage normalMap;
     TGAImage texture;
@@ -933,7 +927,12 @@ namespace Shader
         float intensity;
         
         if(lightMode == LightMode::SIMPLE_LAMBERT){
-            intensity = alpha * v1intensity + beta * v2intensity + gamma * v3intensity;       
+            if(shadeMode == ShadeMode::FLAT){
+                intensity = alpha * v1intensity + beta * v2intensity + gamma * v3intensity;       
+            }
+            else{
+                intensity = computeLambertLighting(calculateNormal(alpha, beta, gamma));
+            }
         }
         else if(lightMode == LightMode::PHONG){
             intensity = computePhongLighting(alpha, beta, gamma);
@@ -1188,7 +1187,6 @@ int main() {
     std::vector<Triangle> tris;
     std::vector<std::vector<Triangle>> models;
 
-
     std::string obj_name = "african_head";
     loadOBJ(obj_name + ".obj", tris);
 
@@ -1196,6 +1194,7 @@ int main() {
     mainCamera.zoom = 250.0f;
     mainCamera.position.y = 0;
     mainCamera.position.z = -2;
+    
     
     if(alphaMode == AlphaMode::ALPHA_MAPPING){
         Shader::normalMap.read_tga_file(obj_name + "_nm.tga");
@@ -1267,9 +1266,10 @@ int main() {
 
 	    float delta = (end - start) / (float)SDL_GetPerformanceFrequency();
 
-        mainCamera.orbitAroundPoint(Vector3d(), 0.4f * delta, Vector3d(0, 1, 0), true);
+        mainCamera.orbitAroundPoint(Vector3d(0, 0, 0), 0.4f * delta, Vector3d(0, 1, 0), true);
 
-        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, 0.5, 0));
+        //rotate light
+        Shader::l_light.direction = mainCamera.getDirection().cross(Vector3d(0, -1.2, 0));
         
 
 
